@@ -1,6 +1,8 @@
 import React from 'react';
+import { Typography, Paper } from '@material-ui/core';
 
-const BlogPost = ({ title, content }) => (
+
+const Blogpost = ({ title, content }) => (
     <div>
       <h2>{title}</h2>
       <p>{content || "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Integer nec odio. Praesent libero. Sed cursus ante dapibus diam. Sed nisi."}</p>
@@ -8,4 +10,4 @@ const BlogPost = ({ title, content }) => (
   );
   
 
-export default BlogPost;
+export default Blogpost;
