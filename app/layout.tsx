@@ -7,9 +7,9 @@ import Navbar from "@/components/navbar";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Nisab Mohd",
+  title: "Joshua Gomes",
   description:
-    "Step into my digital world at Nisab's personal website, where I share my passions, experiences, and the things that make life uniquely mine.",
+    "Hello, World! I'm Joshua Gomes, a Software Engineer and tech enthusiast with a background that might just surprise you!",
 };
 
 const MainFont = Space_Grotesk({

@@ -1,7 +1,7 @@
 ---
 title: Efficient Error Handling in Go
 description: Best practices for robust error management in Go, including using standard error packages, custom error types, and panic recovery.
-published: 1708400133149
+published: 1708214400000
 slug: error-go
 ---
 
@@ -53,81 +53,6 @@ func divide(x, y int) (int, error) {
         return 0, fmt.Errorf("cannot divide %d by zero", x)
     }
     return x / y, nil
-}
-```
-
-## 4. Defer Error Handling with Recover
-
-In some cases, you may want to recover from a panic and handle the error gracefully. This can be achieved using the recover function in combination with defer:
-
-```go
-func dangerousOperation() {
-    defer func() {
-        if r := recover(); r != nil {
-            fmt.Println("Recovered from panic:", r)
-        }
-    }()
-
-    // Perform some operation that might panic
-    // ...
-    panic("something went terribly wrong")
-}
-```
-
-## 5. Use the "errors" Package for Sentinel Errors
-
-The "errors" package provides a way to define sentinel errors, which are predefined error values that can be compared for equality:
-
-```go
-var ErrNotFound = errors.New("not found")  // Sentinel error
-
-func findUser(id int) (*User, error) {
-    // ... code to find user
-    if user == nil {
-        return nil, ErrNotFound
-    }
-    return user, nil
-}
-``` 
-
-## 6. Wrap Errors for Better Context
-
-When returning errors from lower-level functions, you can wrap them with additional context using the errors.Wrap function:
-
-```go
-func someFunc() error {
-    if err := someOtherFunc(); err != nil {
-        return errors.Wrap(err, "someFunc failed")
-    }
-    return nil
-}
-```
-
-## 7. Use the "errors" Package for Error Wrapping
-
-The "errors" package provides a way to wrap errors with additional context using the errors.Wrap function:
-
-```go
-
-func someFunc() error {
-    if err := someOtherFunc(); err != nil {
-        return errors.Wrap(err, "someFunc failed")
-    }
-    return nil
-}
-```
-
-## 8. Handle Errors with Context Using the "errors" Package
-
-The "errors" package provides a way to handle errors with context using the errors.WithMessage function:
-
-```go
-
-func someFunc() error {
-    if err := someOtherFunc(); err != nil {
-        return errors.WithMessage(err, "someFunc failed")
-    }
-    return nil
 }
 ```
 
