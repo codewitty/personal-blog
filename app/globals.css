@@ -1,0 +1,207 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 20 14.3% 4.1%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 20 14.3% 4.1%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 20 14.3% 4.1%;
+
+    --primary: 24 9.8% 10%;
+    --primary-foreground: 60 9.1% 97.8%;
+
+    --secondary: 60 4.8% 95.9%;
+    --secondary-foreground: 24 9.8% 10%;
+
+    --muted: 60 4.8% 95.9%;
+    --muted-foreground: 25 5.3% 44.7%;
+
+    --accent: 60 4.8% 95.9%;
+    --accent-foreground: 24 9.8% 10%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 60 9.1% 97.8%;
+
+    --border: 20 5.9% 90%;
+    --input: 20 5.9% 90%;
+    --ring: 20 14.3% 4.1%;
+
+    --radius: 0.5rem;
+  }
+
+  .dark {
+    --background: 20 14.3% 4.1%;
+    --foreground: 60 9.1% 97.8%;
+
+    --card: 20 14.3% 4.1%;
+    --card-foreground: 60 9.1% 97.8%;
+
+    --popover: 20 14.3% 4.1%;
+    --popover-foreground: 60 9.1% 97.8%;
+
+    --primary: 60 9.1% 97.8%;
+    --primary-foreground: 24 9.8% 10%;
+
+    --secondary: 12 6.5% 15.1%;
+    --secondary-foreground: 60 9.1% 97.8%;
+
+    --muted: 12 6.5% 15.1%;
+    --muted-foreground: 24 5.4% 63.9%;
+
+    --accent: 12 6.5% 15.1%;
+    --accent-foreground: 60 9.1% 97.8%;
+
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 60 9.1% 97.8%;
+
+    --border: 12 6.5% 15.1%;
+    --input: 12 6.5% 15.1%;
+    --ring: 24 5.7% 82.9%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+body {
+  scroll-behavior: smooth;
+}
+
+.dark {
+  color-scheme: dark;
+}
+
+pre {
+  padding: 0 !important;
+  width: inherit;
+}
+
+pre>code {
+  display: grid;
+  padding: 18px 0 !important;
+  @apply font-medium;
+}
+
+.code-line {
+  border-left: 3px solid transparent;
+  padding: 0.75px 8px;
+}
+
+.line-number::before {
+  display: inline-block;
+  width: 1rem;
+  margin-right: 22px;
+  margin-left: -2px;
+  color: rgb(110, 110, 110);
+  content: attr(line);
+  font-size: 13.5px;
+  text-align: right;
+}
+
+
+.highlight-line {
+  border-left: 3px solid #2e74e4;
+  @apply bg-zinc-300/25;
+  @apply dark:bg-zinc-800/45;
+}
+
+.keyword {
+  color: #f32e2e;
+}
+
+.dark .keyword {
+  color: #ee6b6b;
+}
+
+.function {
+  color: #8f59d6;
+}
+
+.punctuation {
+  color: gray;
+}
+
+.comment {
+  color: gray;
+}
+
+.string,
+.constant,
+.annotation,
+.boolean,
+.number {
+  color: #74a8fa;
+}
+
+.tag {
+  color: #6266d1
+}
+
+.attr-name {
+  color: #a19595;
+}
+
+.attr-value {
+  color: #0fa295;
+}
+
+
+.rehype-code-title {
+  @apply bg-zinc-50;
+  @apply dark:bg-zinc-900;
+  @apply px-3;
+  @apply -mb-9;
+  @apply rounded-md;
+  @apply w-fit;
+  @apply text-sm;
+  @apply pt-2;
+  @apply pb-4;
+  @apply font-normal;
+  @apply tracking-wider;
+  @apply text-zinc-700;
+  @apply dark:text-zinc-300;
+  font-family: var(--font-code) !important;
+}
+
+.highlight-comp>code {
+  background-color: transparent !important;
+}
+
+.react-tweet-theme {
+  margin: auto !important;
+  --tweet-body-font-size: inherit !important;
+  --tweet-font-family: var(--font-sans) !important;
+  max-width: 500px !important;
+}
+
+.dark .react-tweet-theme {
+  --tweet-bg-color: #222;
+  --tweet-bg-color-hover: var(--tweet-bg-color);
+  --tweet-quoted-bg-color-hover: hsla(0, 0%, 100%, .03);
+  --tweet-border: 1px solid #333;
+  --tweet-color-blue-secondary: #fff;
+  --tweet-color-blue-secondary-hover: #333;
+  --tweet-font-color-secondary: #9ca3af;
+}
+
+.tweet-header_avatarOverflow__E2gxj {
+  overflow: visible !important;
+  top: -30px;
+}
+
+.tweet-header_avatarOverflow__E2gxj>img {
+  @apply rounded-full;
+}
