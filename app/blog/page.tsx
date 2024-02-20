@@ -3,9 +3,9 @@ import BlogCard from "./blog-card";
 import { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Nisab Mohd - Blog",
+  title: "Joshua Gomes - Blog",
   description:
-    "Explore a collection of personal blogs chronicling my coding journey and experiences, filled with insights, challenges, and solutions.",
+    "Sharing my insights in code and life.",
 };
 
 export default async function BlogIndexPage() {
