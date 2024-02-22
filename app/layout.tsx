@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { ThemeProvider } from "@/components/theme-provider";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
-import { Space_Grotesk } from "next/font/google";
+import { Inter, Space_Grotesk, Zilla_Slab} from "next/font/google";
 import Navbar from "@/components/navbar";
 import "./globals.css";
 
@@ -12,7 +12,8 @@ export const metadata: Metadata = {
     "Hello, World! I'm Joshua Gomes, a Software Engineer and tech enthusiast with a background that might just surprise you!",
 };
 
-const MainFont = Space_Grotesk({
+const MainFont = Inter({
+  weight: "400",
   variable: "--font-body",
   subsets: ["latin"],
 });
