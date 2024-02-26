@@ -1,0 +1,100 @@
+---
+title: Concurrency Part 1- Understanding Concurrency in Go
+description: Understand the benefits of Go&apos;s approach to concurrency.
+published: 1708430400000
+slug: go-concurrency
+---
+
+<ThemedImage filename="gocat.png" width={300} height={300} />
+
+## Concurrency Fundamentals
+
+Concurrency is the ability of a program to deal with multiple tasks in an overlapping manner.  This doesn&apos;t necessarily mean they execute at the exact same instant (that&apos;s parallelism), but rather that progress can be made on one task while momentarily waiting on another.
+
+## Threads: The Traditional Approach
+
+Languages like Python and Java traditionally rely on operating system threads for concurrency. Each thread encapsulates its own execution flow and has its own dedicated stack. While powerful, key challenges include:
+
+* **Overhead:**  Threads have significant memory overhead and context switching between them can be relatively slow.
+* **Synchronization Complexity:** Shared data needs careful synchronization (using locks, etc.) to prevent race conditions. 
+
+## Go&apos;s Approach: Goroutines and Channels
+
+Go takes a radically different approach:
+
+* **Goroutines:** Extremely lightweight "threads" managed by the Go runtime. They have tiny initial stack sizes that grow as needed, and the runtime efficiently schedules them across available threads.
+* **Channels:** Typed conduits for communication between goroutines.  Sending and receiving data on channels provides implicit synchronization.  
+
+## Example: Simulating Network Requests
+
+Let&apos;s see a simplified example to contrast approaches:
+
+**Python (threading):**
+
+```python
+import threading
+import time
+
+def fetch_data(url):
+    # ... simulate network call ...
+    time.sleep(1) 
+    print(f"Fetched data from: {url}")
+
+threads = []
+for url in ['https://site1', 'https://site2']: 
+    t = threading.Thread(target=fetch_data, args=(url,))
+    threads.append(t)
+    t.start()
+
+for t in threads:
+    t.join()
+```
+
+**Go (channels):**
+
+The snippet below demonstrates how to fetch data from multiple websites simultaneously in Go.  It uses goroutines to make network requests concurrently and a channel to collect and synchronize the results.
+
+```go
+package main
+
+import (
+    "fmt"
+    "net/http"
+    "time"
+)
+
+func fetch_data(url string, ch chan string) {
+    // Simulate an actual network request
+    resp, err := http.Get(url) 
+    if err != nil {
+        ch <- fmt.Sprintf("Error fetching from %s: %v", url, err)
+        return
+    }
+
+    // Simulate some processing time
+    time.Sleep(2 * time.Second) 
+
+    ch <- fmt.Sprintf("Fetched %d bytes from: %s", resp.ContentLength, url) 
+}
+
+func main() {
+    ch := make(chan string)
+    for _, url := range []string{"[https://www.google.com](https://www.google.com)", "[https://www.example.com](https://www.example.com)"} {
+        go fetch_data(url, ch) 
+    }
+
+    for i := 0; i < 2; i++ {
+        fmt.Println(<-ch) 
+    }
+}
+```
+
+
+
+I hope this post has provided you with some useful insights!
+
+{/* If you have any questions or feedback, please feel free to reach out to me on [Twitter](https://twitter.com/codewitty_).  */}
+
+Happy coding in Go! 
+
+<ThemedImage filename="gopher.gif" width={300} height={300} />
