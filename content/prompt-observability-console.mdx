@@ -5,6 +5,13 @@ published: 1778328000000
 slug: prompt-observability-console
 ---
 
+<StaticImg
+  src="/prompt-observability-console-header.png"
+  alt="Prompt observability console — build vs buy, version compare, review queue, evaluation summary, telemetry, and deploy gate"
+  width={1600}
+  height={900}
+/>
+
 When we started shipping conversational AI for non-emergency public-safety calls at [Aurelian](https://www.aurelian.com/), we had the same problem every team that ships LLMs in production has: we were iterating on prompts blindly. A change that "felt better" in the dev loop would silently regress correctness in prod. Latency would creep on a Wednesday and nobody could tell which of three prompt edits caused it. We had no way to A/B with eval coverage, no way to attribute regressions to a specific prompt version, and — worst — no way to involve the people who actually knew whether the AI's response was correct.
 
 Those people weren't on the engineering team. They were dispatch trainers, supervisors, and ops folks who had spent decades grading dispatcher performance against agency-specific protocols. They were the only people on earth who could tell you, with authority, whether a 30-second exchange between AI and citizen was right.
