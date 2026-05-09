@@ -64,6 +64,8 @@ The people who could actually tell us whether a response was correct didn't writ
 4. Mark "good" / "needs review" / "wrong" on each exchange.
 5. Leave a note for engineering when something was off.
 
+And — the bigger ask — they wanted to *experiment*. A trainer who has graded ten thousand dispatch calls usually has a strong intuition for what the prompt should say. They wanted to draft a candidate prompt, run it against the eval suite, see how it scored, iterate. Without writing Python. Without opening a pull request. Without an engineer in the loop until the candidate was actually good.
+
 No tool we tried had a surface that was usable by a non-engineer without us writing the UI ourselves anyway. And once we were writing the UI ourselves, we were already most of the way to writing the framework.
 
 ### Voice and multi-turn were second-class citizens
@@ -164,14 +166,15 @@ Per content hash. So when we shipped intake v23 and p95 regressed by 200ms, we c
 
 This is the part I'm proudest of, and the part I think most teams overlook.
 
-We built the entire SME-facing surface in Retool, pointed at our internal API. Four screens:
+We built the entire SME-facing surface in Retool, pointed at our internal API. Five screens:
 
 - **Review queue.** Recent calls, paginated by prompt version, prioritized by uncertainty. SMEs grade in seconds, not minutes.
 - **Side-by-side.** Prompt v17 vs v18, the same call replayed through both. The deltas highlighted automatically. SMEs vote, vote rolls into the eval scorecard.
 - **Regression dashboard.** Pass rate per criterion, per prompt version, per agency. The first time we showed it to a dispatch trainer, she found a regression we had missed in three minutes.
 - **Cherry-pick eval.** Paste a transcript, run it through any prompt version on demand. Used heavily during incident review.
+- **Prompt sandbox.** The most important screen, and the one we built last. SMEs could fork the current prod prompt (or start from scratch), edit it freely, and fire it through the full canonical eval suite — no Python, no PR, no engineer in the loop. They'd see pass rates per criterion, latency estimates, and a side-by-side diff against prod. When a candidate beat the baseline, the screen would generate a draft pull request from the sandbox state and ping engineering for review. Guardrails kept it safe: candidates only ran against the sanitized canonical dataset (never live calls), spend was rate-limited per user, and every sandbox run was logged and attributable.
 
-The win: dispatch trainers and ops became *active participants in the iteration loop*, not bottlenecks waiting on engineering. They flagged regressions before customers did. They proposed prompt changes from real failure modes. They reviewed every prod deploy.
+The win: dispatch trainers and ops became *active participants in the iteration loop*, not bottlenecks waiting on engineering. They flagged regressions before customers did. They drafted, tested, and refined prompt changes themselves — engineering went from "iterate on prompts" to "review and merge candidates that already passed eval." More changes per week, better changes, less coordination overhead.
 
 Building this UI from scratch in React would have eaten months of frontend engineering we did not have. Retool let us ship the SME surface in roughly the same time it took to build the backend that powered it.
 
@@ -230,10 +233,12 @@ Per-call telemetry from production writes into the same results store, keyed by 
 
 **Write the deploy gate before the dashboard.** We built the dashboard first because it was more visible and felt like progress. The deploy gate caught more regressions in its first week than the dashboard caught in its first month. Block bad changes from shipping; *then* build the surfaces to investigate them.
 
+**Ship the sandbox earlier.** We built review and dashboards first, sandbox last — the order felt right because review was where we were drowning. In hindsight the sandbox unlocked an order of magnitude more leverage. SMEs going from "rate the AI" to "design the AI" was the moment the iteration loop actually closed. If we did it again, the sandbox would be week three.
+
 ## The bigger lesson
 
 Most LLM teams I talk to are building an eval loop where engineers are the only graders, the prompts live in a vendor's registry, and the dashboards measure things engineers care about. That works fine if your engineers are the domain experts.
 
 In a regulated, high-stakes domain, the engineers are *not* the domain experts. The eval loop has to include the people who are. Tooling that doesn't make those people first-class participants doesn't actually close the loop — it just makes the engineers feel like they have one.
 
-Build the tool that puts the right humans in the loop. Retool, or whatever your equivalent low-code platform is, will get you there in weeks instead of months. Don't be precious about it.
+Build the tool that lets the right humans *iterate*, not just review. Retool, or whatever your equivalent low-code platform is, will get you there in weeks instead of months. Don't be precious about it.
