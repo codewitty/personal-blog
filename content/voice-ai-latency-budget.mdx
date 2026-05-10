@@ -1,6 +1,6 @@
 ---
 title: Voice AI in Live Conversation — STT + LLM + TTS Under a 600ms Budget
-description: When a citizen asks "is my mom okay?", a two-second pause is the difference between trust and panic. Production voice AI lives or dies in the tail of the latency distribution. Here's how we shipped a real-time conversational agent for non-emergency calls under strict latency budgets — and the parts of the problem that demos never show.
+description: When a citizen asks "is my mom okay?", a two-second pause is the difference between trust and panic. Production voice AI lives or dies in the tail of the latency distribution. Here's how I shipped a real-time conversational agent for non-emergency calls under strict latency budgets — and the parts of the problem that demos never show.
 published: 1737460800000
 slug: voice-ai-latency-budget
 ---
@@ -11,7 +11,7 @@ In a demo, a developer says one well-formed sentence. The system thinks for two 
 
 In production, a citizen calls a non-emergency line at 11pm. They've been in a fender bender. They're stressed. They start a sentence, pause, restart, talk over the agent's first reply. They expect a response that feels like talking to a person — fluid, fast, willing to be interrupted.
 
-The gap between those two artifacts is most of the engineering. This post is about how we closed that gap at Aurelian.
+The gap between those two artifacts is most of the engineering. This post is about how I closed that gap at Aurelian.
 
 ## The budget
 
@@ -29,11 +29,11 @@ TTFAR = endpoint detection
       + audio transport latency
 ```
 
-Our budget for a fluid conversation was around 600ms p95. Above 800ms it starts to feel like the agent is thinking. Above 1.2s the citizen will start to repeat themselves. Above 2s they'll assume the line dropped.
+I set the budget for a fluid conversation at around 600ms p95. Above 800ms it starts to feel like the agent is thinking. Above 1.2s the citizen will start to repeat themselves. Above 2s they'll assume the line dropped.
 
 The naive serial pipeline blows that budget on day one. STT finalization alone can be 300-500ms if you wait for "I think the user is done" with a typical endpointing config. LLM TTFT is another 200-600ms depending on the model. TTS first-frame is often 150-400ms. Add it up: 1.5s before you've even sent audio back.
 
-Every milestone in the project came from finding a place where we could overlap something instead of waiting for it.
+Every milestone in the project came from finding a place where I could overlap something instead of waiting for it.
 
 ## The streaming architecture
 
@@ -55,13 +55,13 @@ caller hears agent
 
 Three things make this fast:
 
-**1. STT runs continuously.** We don't wait for the user to "finish" before transcribing. We keep a rolling transcript with confidence scores. Interim results feed downstream context. By the time the endpointer decides the user is done, we already have the final transcript ready.
+**1. STT runs continuously.** The pipeline doesn't wait for the user to "finish" before transcribing. It keeps a rolling transcript with confidence scores. Interim results feed downstream context. By the time the endpointer decides the user is done, the final transcript is already ready.
 
-**2. LLM starts before STT finalizes.** The moment the endpointer says "probably done" with high confidence, we kick off the LLM with the current rolling transcript. If the user keeps talking after, we cancel and restart. Most of the time they don't, and we've saved 200-400ms.
+**2. LLM starts before STT finalizes.** The moment the endpointer says "probably done" with high confidence, the LLM kicks off with the current rolling transcript. If the user keeps talking after, the in-flight request cancels and restarts. Most of the time they don't, and 200-400ms is saved.
 
 **3. TTS streams from LLM tokens, not from a complete response.** As soon as the LLM emits a token, it goes into the TTS request as part of a streaming text input. TTS frames stream back. The first audio frame goes out the door before the LLM has finished generating.
 
-The cost of all this overlap is cancellation. Every layer has to support cancellation cleanly, because we cancel a lot. STT might decide on a re-segmentation. The LLM might get interrupted by the user starting a new turn. TTS might need to abort mid-utterance and switch to a new response. Cancellation paths are *first-class*, not exception cases.
+The cost of all this overlap is cancellation. Every layer has to support cancellation cleanly, because cancellations happen all the time. STT might decide on a re-segmentation. The LLM might get interrupted by the user starting a new turn. TTS might need to abort mid-utterance and switch to a new response. Cancellation paths are *first-class*, not exception cases.
 
 ## The non-obvious problems
 
@@ -73,9 +73,9 @@ When did the user actually finish talking?
 
 Default endpointing in any streaming STT provider relies on silence detection — a configurable hold time after the last audio. Set it short and you cut people off mid-sentence. Set it long and your TTFAR explodes.
 
-Real callers don't speak in clean sentences. They pause to think. They use filler words. They start a sentence, abandon it, restart. We needed an endpointer that understood semantics, not just silence.
+Real callers don't speak in clean sentences. They pause to think. They use filler words. They start a sentence, abandon it, restart. I needed an endpointer that understood semantics, not just silence.
 
-We layered three signals:
+I layered three signals:
 
 - Silence detection (the cheap one)
 - Acoustic prosody (rising vs falling pitch — questions tend to rise, statements fall)
@@ -89,7 +89,7 @@ The citizen interrupts. Mid-sentence. While the agent is speaking.
 
 What you want: agent stops speaking, listens to the new utterance, responds.
 
-What's tricky: detecting that the new audio is the citizen interrupting and not the agent's own audio leaking through into the input channel. Echo cancellation isn't perfect. We had to combine:
+What's tricky: detecting that the new audio is the citizen interrupting and not the agent's own audio leaking through into the input channel. Echo cancellation isn't perfect. I had to combine:
 
 - Voice activity detection on the input channel
 - A confidence threshold that the input was speech, not echo
@@ -101,14 +101,14 @@ Barge-in is one of those features that sounds simple. It is not.
 
 If you fire the LLM on a rolling interim transcript before the user finishes, the LLM has to handle inputs that get rewritten retroactively.
 
-User says: "I want to report a [pause] cat in a tree." The interim transcript at 400ms is "I want to report a." If you start the LLM there, it'll produce a confidently wrong response — "Okay, what would you like to report?" — that the user will then have to correct.
+User says: "I want to report a [pause] cat in a tree." The interim transcript at 400ms is "I want to report a." If the LLM fires there, it'll produce a confidently wrong response — "Okay, what would you like to report?" — that the user will then have to correct.
 
 Two defenses:
 
 - Never fire on transcripts below a confidence threshold
 - Have the LLM explicitly check whether the input is a complete intent, and if not, return a low-cost continuation that buys time ("Mm-hmm")
 
-We ended up with a class of agent responses we called *acknowledgements*: cheap, generic, polite phrases the agent could emit while waiting for more signal. They bought us latency budget without making the conversation feel robotic.
+I ended up with a class of agent responses I called *acknowledgements*: cheap, generic, polite phrases the agent could emit while waiting for more signal. They bought latency budget without making the conversation feel robotic.
 
 ### Prosody collapse on small TTS chunks
 
@@ -116,7 +116,7 @@ When you stream TTS in tiny chunks (5-10 tokens at a time), the synthesizer does
 
 Stream in larger chunks (40-50 tokens) and the prosody comes back, but you've added 200-300ms to time-to-first-audio.
 
-We tuned chunk size per response type. Greetings and acknowledgements stream small (low-context, fixed prosody anyway). Substantive responses buffer up a sentence's worth of tokens before the first TTS frame goes out — sacrificing some latency to keep the voice human.
+I tuned chunk size per response type. Greetings and acknowledgements stream small (low-context, fixed prosody anyway). Substantive responses buffer up a sentence's worth of tokens before the first TTS frame goes out — sacrificing some latency to keep the voice human.
 
 ### Cancellation cascades
 
@@ -124,17 +124,17 @@ Every cancellation has to propagate. STT cancels → LLM in-flight request must 
 
 If the cancellation cascade has a bug, the system "double-talks": the old response continues while the new response starts. This is one of the worst-feeling failure modes in voice AI. Citizens reach for the disconnect button.
 
-We wrote a test harness that fuzzed cancellation timing — random aborts at every layer — and ran it as part of CI. It caught a class of bugs that no functional test would have surfaced.
+I wrote a test harness that fuzzed cancellation timing — random aborts at every layer — and ran it as part of CI. It caught a class of bugs that no functional test would have surfaced.
 
 ## Trade-offs that mattered
 
-**Smaller chunks vs better prosody.** We compromised: cheap responses stream small, substantive responses buffer a sentence. Different voices for different jobs.
+**Smaller chunks vs better prosody.** I compromised: cheap responses stream small, substantive responses buffer a sentence. Different voices for different jobs.
 
-**Lower-latency model vs higher-quality model.** We used a faster model for trivial turns (acknowledgements, intent gathering) and a stronger model for high-stakes turns (incident description, escalation reasoning). A small router decided which model to fire per turn, in code, based on the conversation state. The router itself rode on the [confidence-aware policy layer](/blog/confidence-aware-routing) — same primitive, different decision.
+**Lower-latency model vs higher-quality model.** A faster model handles trivial turns (acknowledgements, intent gathering); a stronger model handles high-stakes turns (incident description, escalation reasoning). A small router decides which model to fire per turn, in code, based on the conversation state. The router itself rides on the [confidence-aware policy layer](/blog/confidence-aware-routing) — same primitive, different decision.
 
-**Cached responses vs always-live generation.** Greetings, holds, and "let me get a dispatcher" responses were all pre-rendered audio, played from cache. The cache was per-agency (each agency has its own preferred phrasing). For everything else we generated live. Caching where you can buys back latency budget for the cases where you can't.
+**Cached responses vs always-live generation.** Greetings, holds, and "let me get a dispatcher" responses are pre-rendered audio, played from cache. The cache is per-agency (each agency has its own preferred phrasing). Everything else is generated live. Caching where you can buys back latency budget for the cases where you can't.
 
-**Transport vs synthesis.** We initially deployed in a single region. Latency to West Coast callers was fine; latency to East Coast callers was not. Multi-region voice deployment turned out to be more about audio transport latency than inference latency — we'd been optimizing the wrong number.
+**Transport vs synthesis.** I initially deployed in a single region. Latency to West Coast callers was fine; latency to East Coast callers was not. Multi-region voice deployment turned out to be more about audio transport latency than inference latency — I'd been optimizing the wrong number.
 
 ## What real production voice AI is
 
@@ -155,7 +155,7 @@ None of those things are model improvements. All of them are platform engineerin
 
 ## The number
 
-We shipped at sub-600ms p95 TTFAR for the typical conversational turn, and 250-400ms for cached or acknowledgement responses. The faster end of that range is fast enough that callers stop noticing the AI is an AI, which is — for our domain — exactly the bar.
+The system shipped at sub-600ms p95 TTFAR for the typical conversational turn, and 250-400ms for cached or acknowledgement responses. The faster end of that range is fast enough that callers stop noticing the AI is an AI, which is — for the domain — exactly the bar.
 
 The improvement that mattered most wasn't a single optimization. It was eliminating every place where one stage waited on another to finish. The architecture was the win.
 
