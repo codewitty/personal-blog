@@ -1,0 +1,236 @@
+---
+title: The Stripe Credit Ledger — Keeping Money State Correct Across Three Systems
+description: Money state is hard. Money state across three systems — Stripe, your database, and your customer's wallet — is harder. Inside the credit ledger I built for LeadSwitchboard, the patterns that keep balances trustworthy under concurrent webhooks, auto-recharge races, and dispute reversals.
+published: 1750939200000
+slug: stripe-credit-ledger
+---
+
+LeadSwitchboard buyers pay with credits. They buy a package on Stripe, the credits land in their account, and credits get deducted as leads are assigned to them. When the balance dips below a threshold, the system auto-recharges. Disputes can reverse charges weeks after the fact.
+
+Stated like that, it sounds simple. Build it like that and you'll be debugging balance drift inside of a week.
+
+This post is about how I keep money state correct across Stripe, the platform's database, and the buyer's running balance — under retries, races, refunds, and partial dispute reversals.
+
+## Why "Stripe is source of truth" is naive
+
+The first version of any credit system you build will store the balance as a column on the buyer record. Buy credits → increment. Lead assigned → decrement. Balance dropped low → trigger recharge.
+
+It works in dev. It survives the first month in production. Then one of these happens:
+
+- A Stripe webhook is retried because of a transient network hiccup. Your handler runs twice, the buyer is credited twice. They don't notice.
+- A lead gets assigned, the balance is deducted, but the assignment fails downstream. You "refund" the deduction by adding the credit back. The buyer disputes the lead three days later. You "refund" it again. They now have a free credit.
+- Two leads race for the buyer's last credit. Both deduction transactions see balance=1, both succeed, balance goes to -1. Stripe charged once, you assigned twice.
+- Auto-recharge fires when the balance goes below threshold. The webhook for the recharge is delayed 30 seconds. In that window, the balance is still below threshold. Auto-recharge fires again. The buyer is charged twice.
+
+Each one of these is a balance-drift bug. None of them are obvious. All of them compound. By the time they're noticed, the audit table has the right story but the balance column is silently wrong.
+
+The mistake is treating the balance as a stored field. It isn't. **The balance is a query.**
+
+## The ledger pattern
+
+Every credit movement is an immutable row in a ledger table:
+
+```sql
+credit_ledger
+  id              uuid pk
+  buyer_id        uuid
+  movement_type   enum  -- PURCHASE, DEDUCTION, REFUND, DISPUTE_REVERSAL,
+                        -- BONUS, EXPIRATION, AUTO_RECHARGE
+  delta_credits   integer  -- positive or negative
+  balance_after   integer  -- snapshot for fast reads + sanity checking
+  source_id       text     -- stripe_payment_intent_id, lead_id, etc.
+  source_type     enum     -- STRIPE_PAYMENT, LEAD_ASSIGNMENT, etc.
+  idempotency_key text     -- unique with movement_type
+  metadata        jsonb
+  created_at      timestamptz
+```
+
+Three properties of this table matter:
+
+1. **Rows are immutable.** A bug, a dispute, a reversal — none of those mutate an existing row. They write a new compensating row. The history is preserved.
+2. **`idempotency_key` is unique per movement type.** A retried Stripe webhook with the same payment intent ID is a no-op insert. The system never double-credits.
+3. **`balance_after` is a snapshot.** It's a denormalization for fast balance reads, and it's also a sanity check: at any time, summing all `delta_credits` for a buyer must equal the latest `balance_after`. A discrepancy means someone bypassed the ledger.
+
+The current balance is a query (`SELECT SUM(delta_credits) ...`) or a read of the most recent `balance_after`. There is no separately-stored `balance` field on the buyer table.
+
+The buyer's "running balance" they see in their UI is the materialized result of the ledger. The ledger is the truth.
+
+## Stripe webhook idempotency
+
+Stripe retries webhooks aggressively on any non-2xx response. They retry on timeouts. They occasionally deliver out of order. The handler has to be idempotent.
+
+The pattern is simple but easy to get wrong:
+
+```python
+async def handle_payment_intent_succeeded(db: AsyncSession, event: StripeEvent):
+    pi = event.data.object  # PaymentIntent
+
+    # Idempotency check first — has this PI already been credited?
+    existing = await db.execute(
+        select(CreditLedger).where(
+            CreditLedger.idempotency_key == pi.id,
+            CreditLedger.movement_type == MovementType.PURCHASE,
+        )
+    )
+    if existing.scalar_one_or_none():
+        return  # already processed; ack
+
+    # Look up the buyer + package from PI metadata
+    buyer = await load_buyer(db, pi.metadata["buyer_id"])
+    package = await load_package(db, pi.metadata["package_id"])
+
+    # Record the credit in a single transaction
+    await record_movement(
+        db=db,
+        buyer=buyer,
+        movement_type=MovementType.PURCHASE,
+        delta=package.credits,
+        source_id=pi.id,
+        source_type=SourceType.STRIPE_PAYMENT,
+        idempotency_key=pi.id,
+    )
+    await db.commit()
+```
+
+Two non-obvious details:
+
+- **The idempotency check is by `(idempotency_key, movement_type)`, not by `idempotency_key` alone.** A payment intent ID can legitimately appear in multiple movements — the original PURCHASE, and later a REFUND if the buyer disputes. Both should record. They differ on movement type.
+- **The check is part of the same transaction as the insert.** If we check, then insert, with no transaction boundary, two concurrent webhooks for the same PI both pass the check and both insert. The unique constraint on `(idempotency_key, movement_type)` saves us, but the second one errors instead of silently no-op-ing. Wrapping in a transaction means the second handler sees the first one's row and skips cleanly.
+
+## The auto-recharge race
+
+This is the bug I lost a Friday afternoon to.
+
+Auto-recharge logic: when the balance dips below a threshold, fire a Stripe charge for a configured top-up amount. Simple, right?
+
+Naive implementation:
+
+```python
+async def maybe_auto_recharge(db, buyer):
+    balance = await get_balance(db, buyer)
+    if balance < buyer.auto_recharge_threshold:
+        await trigger_stripe_charge(buyer, buyer.auto_recharge_amount)
+```
+
+What goes wrong: this function gets called every time a deduction happens. Two leads assign in quick succession. Both call `maybe_auto_recharge` at nearly the same time. Both see balance below threshold (because the Stripe charge hasn't completed yet — the webhook crediting the buyer is in flight). Both fire `trigger_stripe_charge`. Buyer gets charged twice.
+
+The fix is a hold pattern, same shape as the [lead distribution engine](/blog/lead-distribution-engine):
+
+```python
+async def maybe_auto_recharge(db, buyer):
+    # Lock the buyer row for the duration of this transaction
+    buyer = await db.execute(
+        select(Buyer).where(Buyer.id == buyer.id).with_for_update()
+    ).scalar_one()
+
+    # Check for an in-flight recharge
+    pending = await db.execute(
+        select(CreditLedger).where(
+            CreditLedger.buyer_id == buyer.id,
+            CreditLedger.movement_type == MovementType.AUTO_RECHARGE_INITIATED,
+            CreditLedger.created_at > now() - timedelta(minutes=5),
+        )
+    )
+    if pending.scalar_one_or_none():
+        return  # another recharge is in flight; don't fire again
+
+    balance = await get_balance(db, buyer)
+    if balance < buyer.auto_recharge_threshold:
+        # Record the *initiation* immediately (with delta=0)
+        await record_movement(
+            db, buyer, MovementType.AUTO_RECHARGE_INITIATED,
+            delta=0,
+            idempotency_key=f"auto-{buyer.id}-{int(time.time())}",
+        )
+        await db.commit()
+        # Now fire the Stripe charge; webhook will record the actual credit
+        await trigger_stripe_charge(buyer, buyer.auto_recharge_amount)
+```
+
+Two things make this work:
+
+- **The row lock prevents two concurrent calls from both seeing "no in-flight recharge."** They serialize on the buyer's row. The second one sees the initiation row the first one wrote.
+- **The initiation row has `delta=0`.** It doesn't credit the buyer — the actual credit comes from the Stripe webhook on payment_intent.succeeded. The initiation row is just a marker that says "a recharge is pending." If the Stripe charge fails, a separate failure webhook writes a `AUTO_RECHARGE_FAILED` row that clears the pending state.
+
+This is a textbook race condition with a textbook fix. The reason I'm including it is that the naive version *will* ship to production unless the engineer building it has been burned by it before.
+
+## Disputes and the partial-refund problem
+
+A buyer disputes a lead a week after the assignment. The system needs to:
+
+1. Reverse the credit deduction
+2. Make sure the reversal is auditable (who disputed, why, when, by what process)
+3. Not allow disputing the same lead twice
+4. Handle the case where the buyer has *used* the lead since the deduction (the lead generated revenue for the buyer; the dispute might still be valid, or might not)
+
+The ledger pattern handles all of this naturally:
+
+```python
+async def reverse_lead_credit(db, lead_assignment, dispute):
+    # Has this assignment already been reversed?
+    existing_reversal = await db.execute(
+        select(CreditLedger).where(
+            CreditLedger.source_id == lead_assignment.id,
+            CreditLedger.movement_type == MovementType.DISPUTE_REVERSAL,
+        )
+    )
+    if existing_reversal.scalar_one_or_none():
+        raise AlreadyReversedError()
+
+    # Find the original deduction
+    original = await db.execute(
+        select(CreditLedger).where(
+            CreditLedger.source_id == lead_assignment.id,
+            CreditLedger.movement_type == MovementType.DEDUCTION,
+        )
+    ).scalar_one()
+
+    # Write a compensating row with delta = -original.delta
+    await record_movement(
+        db,
+        buyer=original.buyer,
+        movement_type=MovementType.DISPUTE_REVERSAL,
+        delta=-original.delta_credits,  # flip the sign
+        source_id=lead_assignment.id,
+        source_type=SourceType.LEAD_ASSIGNMENT,
+        idempotency_key=f"dispute-{dispute.id}",
+        metadata={
+            "dispute_id": str(dispute.id),
+            "dispute_reason": dispute.reason,
+            "original_movement_id": str(original.id),
+        },
+    )
+    await db.commit()
+```
+
+The buyer's balance now reflects the reversal — automatically, because balance is the sum of the ledger and the new compensating row was just added. No mutations to historical rows. The original deduction is preserved with its full context. The reversal is its own row with a clear provenance.
+
+If the dispute itself is later overturned (the agency rules in the buyer's favor was wrong), a *third* row — a DISPUTE_DENIED reversal — re-deducts the credit. The ledger tells the whole story.
+
+## Reconciliation: the nightly truth check
+
+A ledger you don't reconcile is a ledger you don't trust.
+
+Every night, a job runs that:
+
+1. Fetches all `payment_intent.succeeded` events from Stripe for the last 24 hours
+2. Confirms each one has a corresponding PURCHASE row in the ledger
+3. Sums the credits delivered for each buyer in the ledger
+4. Confirms it matches the sum of the actual Stripe charges (less any refunds)
+5. Alerts on any discrepancy
+
+The job has caught two real bugs in production. Once was a webhook handler that crashed mid-processing and left an unprocessed event. Once was a Stripe outage during which a few payment intents succeeded but the webhooks were never delivered (Stripe redelivered them eventually but the gap was visible).
+
+Without the reconciliation job, both of those would have surfaced as customer support tickets days later. With it, they alerted within hours and were resolved before customers noticed.
+
+## What this teaches about platforms
+
+A money-handling platform has three ironclad rules:
+
+1. **Mutations to balance fields are bugs.** All credit movements are immutable rows. Balance is derived.
+2. **Webhook handlers must be idempotent.** Retries are not an exception path; they're a normal path.
+3. **Reconcile, always.** The platform's truth and the upstream's truth must be checked against each other on a schedule. If you're not reconciling, you don't know whether you have a drift bug.
+
+These three rules are what separates a credit system that works in demos from one that survives production. None of them are visible in the customer-facing UI. All of them are non-negotiable.
+
+If you're building a credit, points, or balance system today, build the ledger first. Build the reconciliation second. Everything else gets easier from there.

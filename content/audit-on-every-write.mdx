@@ -1,0 +1,168 @@
+---
+title: Audit-on-Every-Write — How to Make the Hard Way the Only Way
+description: Most engineering teams agree that mutations should be audit-logged. Few have the discipline, tooling, and process to actually do it on every write. Here's how I made audit logging non-skippable in a multi-tenant SaaS — what to enforce, how to enforce it, and the failure modes that make audits silently wrong.
+published: 1749729600000
+slug: audit-on-every-write
+---
+
+If your write path can ship without an audit log, your audit log is decorative.
+
+This is the rule I built around at LeadSwitchboard. Every handler that mutates agency-owned data — every POST, PUT, PATCH, DELETE, every background job, every system-triggered cleanup — emits an audit row. No exceptions. Reads don't audit. Writes always do.
+
+That sentence is easy to say. The discipline to enforce it is what most engineering organizations don't have. This post is about how I built that discipline, what it costs, and what it returns.
+
+## Why audits slip in most codebases
+
+Engineers want to ship. Audit logging is overhead that doesn't move the feature forward. The first time it slips, nothing visible breaks. The tenth time it slips, you have a compliance gap. The hundredth time, your audit log is unreliable enough that nobody trusts it for anything that matters.
+
+The slow drift goes like this:
+
+1. The team agrees audit logs are important.
+2. A helper function is written. People mostly remember to call it.
+3. A new endpoint ships without it. Nobody notices.
+4. A pattern emerges: simple endpoints get audited, complex ones get a TODO.
+5. Background jobs never had audits because "they're internal."
+6. The audit log has gaps that map almost perfectly to the most important mutations.
+7. Compliance asks for a six-month change history. The team realizes the answer is partial.
+
+Each step is small. The result is a system you can't reason about.
+
+## The non-negotiable
+
+The rule is one sentence: **every handler that writes to agency-owned data emits an audit row, regardless of who triggered it.**
+
+That includes:
+
+| Operation | Audited? |
+|-----------|---------|
+| `POST` creating a resource | Yes |
+| `PUT` / `PATCH` updating a resource | Yes |
+| `DELETE` removing a resource | Yes |
+| Background job mutating state | Yes (`actor_user_id=None`, source recorded) |
+| Webhook handler reacting to upstream | Yes (actor inferred from webhook origin) |
+| `GET` returning data | No |
+
+Background jobs were the most common slip in my experience. The reasoning was always "this is internal, the agency didn't trigger it." The audit row exists to answer the question *"what changed and why?"* — and "the system did it" is exactly the answer that matters most when something goes wrong at 3am.
+
+## Make the right thing easy
+
+The single biggest factor in whether engineers audit-log consistently is whether the helper feels like part of the write path or like a separate task. I built it as part of the write path:
+
+```python
+from app.audit import AuditAction, AuditService
+
+async def create_thing(
+    db: AsyncSession,
+    request: Request,
+    agency: Agency,
+    payload: ThingCreate,
+):
+    thing = Thing(agency_id=agency.id, **payload.model_dump())
+    db.add(thing)
+    await db.flush()  # populate thing.id
+
+    await AuditService.add(
+        db=db,
+        request=request,
+        agency_id=agency.id,
+        action=AuditAction.THING_CREATED,
+        target_type="thing",
+        target_id=str(thing.id),
+        actor_user_id=request.state.user.id,
+        success=True,
+    )
+
+    await db.commit()
+    return thing
+```
+
+A few choices in there matter:
+
+- **Audit is part of the same transaction as the write.** If the audit insert fails, the write rolls back. There's no universe where the data changed but the audit row is missing.
+- **`db.flush()` before audit.** The audit needs the generated ID. Flush surfaces it without committing.
+- **The `success` flag is explicit.** Audits exist for failures too. A handler that intends to mutate but rejects the request still emits an audit row with `success=False` and a reason. Failed attempts are often the most interesting rows in the table.
+- **The action is an enum, not a free-text string.** Drift on action names is the silent killer of an audit table. Enums make additions code-reviewable.
+
+## Enforcement: the linter and the test fixture
+
+A rule that depends on engineers remembering it isn't a rule. It's a prayer.
+
+Two enforcement layers caught the slips:
+
+**Layer 1: a linter rule.** A simple AST check in CI that walks every route handler and verifies an `AuditService.add` call is reachable on the success path. Endpoints that explicitly don't need it (the proxy passthrough, health checks) are tagged with a decorator (`@no_audit_required(reason="...")`) so the lint exception is itself documented.
+
+The linter doesn't catch every case — it can't tell whether an audit semantically matches the mutation. But it catches the common slip of "the engineer forgot the audit call exists" with very high precision.
+
+**Layer 2: a pytest fixture.** Every integration test for a write handler runs through a fixture that asserts an audit row was written matching the expected action. If you write the test correctly and forget the audit, the test fails. If you remember the audit but get the action name wrong, the test fails. The fixture has caught more bugs than the linter.
+
+```python
+async def test_create_thing_writes_audit(client, agency_admin):
+    with assert_audit_emitted(action=AuditAction.THING_CREATED) as audits:
+        response = await client.post("/admin/things", json={...})
+    assert response.status_code == 201
+    assert audits[0].target_id == response.json()["id"]
+```
+
+Engineers don't have to remember to write that fixture call — it's in the test boilerplate.
+
+## What to log, what not to log
+
+The schema is intentionally narrow:
+
+- `action` (enum)
+- `target_type` (e.g. `"buyer"`, `"lead"`, `"pricing_rule"`)
+- `target_id` (string; the resource ID)
+- `actor_user_id` (nullable; null for system-triggered)
+- `actor_source` (e.g. `"web"`, `"api_key"`, `"webhook:ghl"`, `"job:auto_recharge"`)
+- `agency_id` (the tenant)
+- `success` (boolean)
+- `reason` (nullable; populated on failure or notable success)
+- `metadata` (JSONB; bounded shape)
+- `created_at` (server time)
+- `request_id` (correlates with structured logs)
+
+Things I deliberately don't log:
+
+- **Full request bodies.** Bodies often contain PII or auth tokens. The audit doesn't need them; structured logs (with separate retention rules) do.
+- **Full response bodies.** Same reason.
+- **PII fields directly.** A mutation to a buyer's phone number logs the *action*, not the new phone number. If the actual changed value matters for an investigation, a separate change-data-capture stream answers that — with stricter access controls and shorter retention.
+- **Stack traces.** Audit is for "what happened." Stack traces are for "what crashed." Mixing them turns the audit table into an error log.
+
+The audit table is for answering *who did what to which resource, when, and did it succeed*. Anything beyond that belongs in adjacent systems with their own access models.
+
+## Compliance dividend
+
+Twelve months in, the dividend is real:
+
+- An enterprise prospect asked for "every change to a specific buyer's account in the last 90 days." Answer: one query, ten seconds, paginated CSV.
+- A pricing-rule misconfiguration affected one agency for two days. Answer to "who changed it and when?" was instant. The fix took longer than the investigation.
+- A buyer claimed the system charged them for a lead they never received. The audit log showed assignment was attempted but a notification failed; the buyer was correct. Refund was processed without negotiation because the evidence was unambiguous.
+- A SOC 2 auditor asked for change-management evidence. The audit table answered four of their seven control requirements directly.
+
+None of these moments were planned for. All of them were cheap because the audit log already existed and was trusted.
+
+## Failure modes: audits that lie
+
+The hardest thing about audit logging isn't getting it written. It's keeping it from drifting from the truth of what actually happened.
+
+Three failure modes I've watched for:
+
+**Audit before commit.** If you write the audit row and then commit, and the commit fails, the audit says the mutation happened when it didn't. The fix is to make the audit part of the same transaction as the write — same `AsyncSession`, same commit boundary. Above, the audit insert and the resource insert share `db.commit()`.
+
+**Audit in a separate transaction.** A pattern I rejected early: writing audits to a separate table via a separate connection, "for performance." This *guarantees* drift. The audit writes can succeed when the mutation rolls back, and vice versa. Same connection, same transaction, every time.
+
+**Audit for the wrong actor.** A common mistake is logging the user who initiated a request when the actual mutation happened in a deeper layer that runs as a different identity (e.g., a system service account). The audit ends up saying "user X did Y" when in fact "user X requested that the system do Y on their behalf." The fix is to log both: the request actor and the effective actor.
+
+**Audit metadata that goes stale.** Storing `target_name` alongside `target_id` is convenient — until the resource is renamed, and now the audit log shows a name that no longer matches reality. I store IDs only; names are joined in at query time, with a clear "name at time of audit" column derived from a snapshot table when historical accuracy matters.
+
+## What this teaches about platforms
+
+A platform's job is to make the right thing the default. Audit-on-every-write is a pattern with three platform-shaped components:
+
+- **A primitive** (the `AuditService.add` helper) that's part of the write path, not adjacent to it
+- **A guarantee** (same-transaction commit) that the primitive can't be quietly broken
+- **An enforcement layer** (linter + test fixture) that turns the cultural rule into a build-time error
+
+If any of those three is missing, audits drift. If all three are in place, the rule enforces itself.
+
+That's the shape of a good engineering rule: easy to follow, hard to skip, impossible to silently violate. Build them where they matter and the system runs itself.

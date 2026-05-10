@@ -1,0 +1,172 @@
+---
+title: Neon Branch-per-Worktree — Parallel Agent Development Without DB Chaos
+description: Running five Claude Code agents on the same repo without a single port collision or shared-DB conflict. How I built a worktree-aware dev script that gives each agent its own isolated environment — frontend port, backend port, and a copy-on-write Postgres branch — in one command.
+published: 1750334400000
+slug: neon-branch-per-worktree
+---
+
+In 2026, every engineer I know is running multiple coding agents in parallel. The agent doing UI work in one terminal, the one doing the migration in another, the one fixing a bug in a third. They're all on the same repo, all wanting to run dev servers, hit a database, run tests.
+
+The naive setup falls over fast. Two agents try to bind to port 3000. One agent runs a migration that the other one's tests aren't expecting. The Stripe webhook listener you started for one agent fires events into the database the other agent is reading from. The result is the parallel-agents version of two cooks in the same kitchen — productive in theory, chaotic in practice.
+
+I solved this for LeadSwitchboard. Each agent gets its own git worktree, its own pair of dev ports, and its own isolated copy-on-write Postgres branch on Neon. Bring-up is one command. The agents never collide. This post is how it works.
+
+## The problem in detail
+
+The shared-resource collisions are obvious once you start running agents:
+
+- **Port collisions.** Both Next.js and FastAPI default to fixed ports. Two agents trying to start dev servers fight for the same port number. One wins, the other crashes, the agent dutifully tries the next port and now you have a config drift problem.
+- **Database collisions.** Even if both agents only read, one of them might run an autogenerate migration on a feature branch and leave the schema in a state the other isn't expecting. If both agents both run migrations, your local DB schema is whichever one landed last.
+- **Filesystem collisions.** Two agents writing to `node_modules/` at the same time is asking for trouble. Two agents both regenerating Prisma clients will produce a non-deterministic mess.
+- **Webhook collisions.** Stripe and the CRM webhook tunnels both terminate at one ngrok URL. Events fired during one agent's test run get processed by another agent's backend.
+
+Each of these has an ad-hoc fix. None of them have an ergonomic fix. The whole-system-isolation answer is the only one that scales past two agents.
+
+## Worktrees as the isolation unit
+
+Git worktrees are the right primitive. A worktree is a separate filesystem checkout of the same repo, on its own branch, sharing the same `.git` directory and history. They're cheap, instant to create, and don't duplicate any history.
+
+The structure I converged on:
+
+```
+~/apps/platform/                    ← main checkout
+~/apps/platform/.claude/worktrees/
+  feature-a/                        ← worktree on branch feature-a
+  bugfix-b/                         ← worktree on branch bugfix-b
+  spike-c/                          ← worktree on branch spike-c
+```
+
+Each worktree has its own filesystem, so its own `node_modules`, its own `.next/` build cache, its own everything-derived-from-source. They share git history and `.gitignore`, so untracked working-tree state from one doesn't pollute another.
+
+Creating one is a single command:
+
+```bash
+claude -w feature-a
+```
+
+This creates the worktree if it doesn't exist, switches the agent into it, and gives the agent a clean tree to work in.
+
+## Deterministic port allocation from the worktree path
+
+The trick that makes parallel agents possible without configuration is computing dev ports deterministically from the worktree's filesystem path.
+
+```bash
+# Hash the worktree path into a stable port range
+hash=$(echo "$PWD" | shasum -a 256 | head -c 4)
+fe_port=$((3100 + 0x$hash % 100))
+be_port=$((8100 + 0x$hash % 100))
+```
+
+The same path always hashes to the same ports. Each worktree gets a stable, predictable, collision-resistant pair of ports. No `.env` editing, no manual configuration, no remembering which agent is on which port — open the worktree, run the dev script, see your ports.
+
+The script writes the ports to a file the frontend can read so the API base URL is set correctly:
+
+```
+NEXT_PUBLIC_API_URL=http://localhost:8147
+```
+
+And it prints the URLs at startup so the agent can verify them:
+
+```
+Frontend: http://localhost:3147
+Tenant:   http://demodev.localhost:3147/admin/leads
+```
+
+Because the platform is multi-tenant on subdomain (`<agency>.leadswitchboard.io`), the dev URL uses `*.localhost` resolution which most browsers handle correctly without `/etc/hosts` edits.
+
+## The Neon piece: copy-on-write branches per git branch
+
+Ports solve compute isolation. Database isolation is the harder problem.
+
+Neon has a feature that turns out to be perfect for this: **branches**. A Neon branch is a copy-on-write snapshot of the parent database. Creating one is essentially free (no data copy until divergence). They're isolated — writes to one branch don't affect the other. They're full Postgres — you can connect to them like any other DB.
+
+The dev script wires this in:
+
+```bash
+# Map the git branch to a Neon branch name
+git_branch=$(git rev-parse --abbrev-ref HEAD)
+neon_branch="dev-$git_branch"
+
+if ! neonctl branches list --project-id "$NEON_PROJECT_ID" \
+     | grep -q "$neon_branch"; then
+    # First run for this git branch — create the Neon branch
+    neonctl branches create --name "$neon_branch" \
+        --project-id "$NEON_PROJECT_ID"
+    
+    # Get the connection string and run migrations
+    export NEON_PLATFORM_DATABASE_URL=$(
+        neonctl connection-string "$neon_branch" \
+            --project-id "$NEON_PROJECT_ID"
+    )
+    alembic upgrade head
+else
+    # Branch exists — reuse it, no migration needed
+    export NEON_PLATFORM_DATABASE_URL=$(
+        neonctl connection-string "$neon_branch" \
+            --project-id "$NEON_PROJECT_ID"
+    )
+fi
+```
+
+The result: every git branch has its own Postgres database that starts as an exact copy of the parent and diverges as the agent works. Migrations on one branch don't affect any other branch. Test data inserted by one agent's test run doesn't appear in another agent's database.
+
+When the agent merges and the worktree gets cleaned up, the Neon branch can be deleted manually. (I haven't built automatic cleanup yet — that's a known gap.)
+
+## The full bring-up sequence
+
+Putting it all together, `worktree-dev.sh` does this on first run for a new branch:
+
+1. Source environment from `.zshrc` (which has Neon API keys, Clerk keys, etc.)
+2. Compute deterministic ports from `$PWD`
+3. Check if `node_modules` exists; install if not
+4. Check if Neon branch `dev-<git-branch>` exists; create + migrate if not
+5. Export `NEXT_PUBLIC_API_URL` and `NEON_PLATFORM_DATABASE_URL` to the right values
+6. Start the FastAPI backend on the computed port
+7. Start the Next.js frontend on the computed port
+8. Print the tenant URL
+
+Total time on a fresh worktree: about 30 seconds (mostly `npm install`). On a returning worktree: about 5 seconds.
+
+The agent can immediately run tests, hit the API, see the UI, generate migrations — all without thinking about whether another agent is in the same state space.
+
+## The migration-conflict edge case
+
+There's one place where parallel agents on parallel branches can still trip over each other: Alembic autogenerated migrations.
+
+If two agents both add migrations to the same parent revision, you end up with two heads. The merge looks like:
+
+```bash
+# In whichever worktree merged second
+alembic merge heads -m "merge feature-a and bugfix-b"
+alembic upgrade head
+```
+
+I documented this in CLAUDE.md so agents know to handle it. In practice it happens maybe once every couple of weeks. The fix is mechanical and the script can detect and prompt for it.
+
+## What this unlocks
+
+The compounding effects of full isolation are what make this worth it:
+
+- **Truly parallel feature work.** Two agents shipping unrelated features can work without any coordination — different ports, different databases, different filesystems.
+- **Realistic testing on real-shaped data.** Each Neon branch is a full snapshot of the parent. Test data isn't synthetic; it's a real-shape fixture. Bugs that only show up with real data shapes get caught at dev time.
+- **Per-branch Vercel previews.** Push the worktree branch and Vercel deploys a preview against that branch's database (via env var injection at deploy time). The branch is reviewable end-to-end without merging anything.
+- **Cheap rollback.** If an agent's experiment goes sideways, the entire worktree — code, branch, Neon DB — is throwaway. No "I broke my local DB" recovery work.
+- **Reproducible bug reports.** A bug found on `feature-a` is reproducible because the database state is preserved. No "works on my machine" because every machine's machine is the same machine.
+
+## What I'd do differently
+
+**Build automatic cleanup from day one.** Branches accumulate. Neon doesn't charge much for branch storage but the list gets unwieldy past 30-40 branches. A nightly job that deletes Neon branches whose corresponding git branch has been merged or deleted would have saved a lot of manual `neonctl branches delete` calls.
+
+**Use Neon branch IDs, not names.** I keyed branches off git branch names because they're human-readable. Branch names with slashes (`feature/foo-bar`) and special characters caused problems early on. Hashed names with the human name in metadata would have been more robust.
+
+**Add a port-conflict guard.** The hash function has a small but nonzero chance of two paths hashing to the same port range. I never hit it in practice but the script doesn't currently warn if it would. A check-before-bind step would be cheap insurance.
+
+**Pre-warm node_modules in a shared cache.** Each worktree currently does its own `npm install`. A shared package cache via pnpm or yarn berry would make first-bring-up significantly faster.
+
+## The bigger lesson
+
+Agent-driven development is a different shape of dev workflow. Tools designed for one human at one desk on one branch don't quite fit. The first thing to break is shared mutable state — ports, databases, environment variables — because the human conventions ("I'll start the backend, you wait") don't translate.
+
+The fix isn't more discipline. It's more isolation. Worktrees + deterministic ports + branch databases give each agent the equivalent of its own development environment without paying the cost of actually maintaining N environments.
+
+If you're running parallel agents and finding yourself coordinating around shared resources, the tools that fix it already exist. Combine them and the agents stop colliding.

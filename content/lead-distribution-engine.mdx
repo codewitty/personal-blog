@@ -1,0 +1,166 @@
+---
+title: Distributing One Lead to N Buyers — Concurrency, Credits, and the Ugly Details
+description: A lead arrives. Three buyers are eligible. Each one's credit balance is one assignment away from zero. Now distribute it without double-charging anyone, dropping the lead, or letting two buyers think they got it first. Inside the lead distribution engine I built for LeadSwitchboard.
+published: 1749124800000
+slug: lead-distribution-engine
+---
+
+A lead arrives at LeadSwitchboard. The system has roughly 800ms to do something useful with it: figure out which buyers are eligible, charge their credit balances, send them the lead, and surface it in their dashboards. Whoever responds fastest closes the deal. Everything that delays distribution is revenue someone else takes.
+
+This is the engine that does that. It's the most "the product can't exist without this" piece of code in the platform, and it's also the part that's easiest to get wrong in subtle, expensive ways.
+
+This is how I built it, and what the obvious-but-wrong version looks like.
+
+## The shape of the problem
+
+A pay-per-lead agency ingests leads from somewhere — a landing page, a CRM webhook, a partner integration — and sells each lead to one or more service-pro buyers. Buyers maintain a credit balance. When a lead matches a buyer, the system deducts the credit, hands them the lead, and notifies them. Buyers compete on response time.
+
+So distribution is a three-step pipeline:
+
+1. **Eligibility.** Of all the buyers signed up for this agency's service line, which ones match this lead? Service area, schedule, capacity, opt-outs.
+2. **Hold.** Reserve credits for each candidate buyer. This is where most of the bugs live.
+3. **Settle.** Send the lead to each buyer who got a successful hold. Confirm assignment. Fire telemetry. Optionally hand off to a voice qualification queue.
+
+Each lead can fan out to multiple buyers. Each buyer's credit balance can change between the eligibility evaluation and the hold. Buyers can dispute a charge later and force a rollback. The system is async, multi-tenant, and webhook-fed (which means retries are real).
+
+The naive version of this is a `for buyer in eligible: deduct(buyer); assign(buyer)`. That version is wrong on day one.
+
+## Why the naive version is wrong
+
+Three failure modes show up immediately:
+
+**Race conditions on credit balance.** Buyer A has 1 credit left. Two leads arrive 200ms apart. Both eligibility evaluators see balance=1, both deductions succeed, balance goes to -1. Now Stripe has charged the buyer for one lead and you've assigned them two.
+
+**Long-tail latency.** A serial loop over eligible buyers means a slow Stripe webhook, a slow notification provider, or a slow database query on buyer N blocks all subsequent assignments. The lead's age clock starts at ingestion. Every millisecond of serial work is a millisecond a faster competitor can beat you to the buyer.
+
+**Partial failure.** Halfway through a fan-out, the database connection pool is exhausted. You've assigned the lead to three buyers and crashed before assigning to the fourth. The fourth buyer never sees the lead. The lead's distribution state is now inconsistent and unrecoverable without manual intervention.
+
+The fix for all three is the same shape: separate eligibility from holding from settling, run holds in parallel, treat each step as an independent state-machine transition with its own rollback semantics.
+
+## The async distribution shape
+
+The engine runs on FastAPI with `asyncio` and an in-process task queue. Each step is its own async function with its own retry behavior:
+
+```python
+async def distribute_lead(db: AsyncSession, lead_id: UUID) -> DistributionResult:
+    lead = await load_lead(db, lead_id)
+    candidates = await evaluate_eligibility(db, lead)
+
+    # Fan out hold attempts in parallel
+    hold_results = await asyncio.gather(
+        *(attempt_hold(db, lead, buyer) for buyer in candidates),
+        return_exceptions=True,
+    )
+
+    # Only buyers we successfully held credits for proceed to assignment
+    successful = [h for h in hold_results if isinstance(h, Hold) and h.ok]
+
+    settled = await asyncio.gather(
+        *(settle_assignment(db, hold) for hold in successful),
+        return_exceptions=True,
+    )
+
+    return DistributionResult(
+        lead_id=lead.id,
+        attempted=len(candidates),
+        succeeded=len([s for s in settled if isinstance(s, Assignment)]),
+        failed=[h for h in hold_results if not isinstance(h, Hold) or not h.ok],
+    )
+```
+
+Three things matter about this shape:
+
+1. **Eligibility is a single point of fan-in.** All the matching logic — service area polygons, schedule windows, capacity, opt-outs — is one query. If it's slow, every lead is slow. This is where most of the optimization budget goes.
+2. **Holds run concurrently.** Each hold is independent. A slow buyer doesn't block a fast one. The `asyncio.gather` returns exceptions instead of raising so a single hold failure doesn't poison the whole distribution.
+3. **Settlement is also concurrent.** Sending the lead to the buyer, firing notifications, writing audit logs — all of it parallelizes per buyer.
+
+The whole pipeline runs in a single backend transaction *up to the hold step*. After holds, each buyer's settlement is its own transaction so a slow notification on buyer 3 doesn't roll back assignments to buyers 1 and 2.
+
+## Money correctness: the hold pattern
+
+This is the core of the engine. The naive version — "deduct credit, then assign" — is wrong. The right version is a three-step ledger:
+
+```
+HOLD       (funds reserved, not yet spent)
+  ↓
+SETTLE     (assignment confirmed, hold becomes a debit)
+  ↓
+SETTLED    (immutable; counted toward balance)
+
+or:
+
+HOLD       (funds reserved)
+  ↓
+RELEASE    (assignment failed; hold reversed; no charge)
+```
+
+Three properties this gives you:
+
+- **Concurrent holds against the same balance compose correctly.** Two leads racing for buyer A's last credit: the database places a lock on the balance row during the hold transaction, the second hold fails fast with `INSUFFICIENT_FUNDS`, the second lead's distribution result records that buyer A wasn't reachable. No oversell.
+- **Settlement is idempotent.** Same hold ID, same settlement call: no-op the second time. Webhook retries from upstream don't double-charge.
+- **Disputes don't have to time-travel.** A dispute reverses the SETTLE row with a new compensating row. Balance is recomputed from the immutable ledger. There's no "undo the credit deduction we made yesterday" path because we don't mutate balances directly — they're a derived view of the ledger.
+
+The single most common mistake I've seen in pay-per-lead systems is treating the credit balance as a stored field that gets incremented and decremented in place. As soon as you have concurrent webhooks, refunds, disputes, or retries, that field's value drifts from the truth of what actually happened. The ledger is the truth. Balance is a query.
+
+## Eligibility evaluation: the part that's secretly hard
+
+Eligibility looks like a simple `WHERE` clause until you actually look at it.
+
+A buyer is eligible for a lead if:
+
+- They're subscribed to the right service line for this lead's category
+- Their service area polygon contains the lead's location (or overlaps it within tolerance)
+- Their schedule says they're accepting leads right now (timezone-aware, recurring rules)
+- Their daily/weekly capacity hasn't been hit
+- They haven't opted out of this lead's specific characteristics (e.g., job size, urgency tier)
+- They have credits available, or auto-recharge is enabled and they're under their cap
+- They aren't currently disputing more than the agency's allowed threshold of leads
+- The agency hasn't paused them or marked them in cooldown
+
+That's eight separate predicates, each potentially backed by a different table. The naive implementation is a query per buyer, which scales like garbage.
+
+What I built is a single SQL query that joins buyers to all their eligibility-relevant state, with the geography check in PostGIS, and returns a sorted list of candidates with their reason-codes if they were excluded. That's the eligibility evaluator. It returns in well under 100ms for agencies with hundreds of buyers, and the reason-codes are gold for support — when a buyer asks "why didn't I get that lead?", the answer is one query away.
+
+The reason-codes also feed an internal "near-miss" dashboard that shows agencies which buyers are losing eligibility and why. Capacity hits, schedule misses, area-edge misses. It's been one of the more loved internal-product features.
+
+## The voice queue handoff
+
+For some agencies, leads aren't distributed raw — they're qualified by a Vapi-powered voice agent first, and only the qualified ones get fanned out to buyers. That qualification is async (the call can take 30-90 seconds), which means it lives between ingestion and distribution.
+
+Architecturally:
+
+```
+ingestion → eligibility (skip if voice-qualifying) → voice queue
+                                                       ↓
+                                              voice qualification
+                                                       ↓
+                                              re-enter pipeline at hold step
+```
+
+The voice queue is its own state machine: `QUEUED → DIALING → IN_CALL → QUALIFIED | DISQUALIFIED | NO_ANSWER | FAILED`. Each transition is logged and idempotent. A Vapi webhook dropping or arriving twice doesn't break the lead's lifecycle.
+
+The thing I learned the hard way: cancellation has to propagate. If the lead is disputed or pulled by the agency while a voice call is in progress, the call needs to abort cleanly and not transition to a state that triggers downstream distribution. Cancellation paths in async pipelines are first-class; treat them as production code, not exception handlers.
+
+## Telemetry as a routing primitive
+
+Every state transition emits a row keyed by the lead ID, the buyer ID, and the transition type. That gives me three dashboards I rely on daily:
+
+- **Lead lifecycle latency.** p50/p95/p99 from `INGESTED` to `FIRST_ASSIGNMENT_SETTLED`. This is the number that matters to revenue. Anything over 1.5s p95 starts costing close rates.
+- **Eligibility drop-off funnel.** For every 100 leads that arrive, how many had any eligible buyer? How many had hold failures? How many had settlement failures? The funnel surfaces eligibility gaps that a customer would never notice.
+- **Buyer fairness.** Per-buyer assignment volume vs eligibility volume. A buyer who's eligible for 30% of leads but only assigned 5% has a hold-failure problem (probably credit balance). A buyer who's eligible for 5% but assigned 5% is healthy.
+
+These three views are what I'd build first if I started over. They're how you find the bugs you don't know you have.
+
+## What I'd do differently
+
+**Introduce the hold pattern from day one.** I shipped the first version with direct balance mutations and refactored to the ledger model later. The migration was painful: every existing balance had to be replayed from the journal, every webhook handler had to be retrofitted to the ledger API. If I'd started with the ledger, the cost would have been one extra abstraction in the first week.
+
+**Separate the eligibility evaluator into its own service earlier.** It's CPU-bound geography work that benefits from being callable independently — for "why didn't this buyer get this lead?" support, for capacity planning, for what-if pricing analysis. It started as a private function inside the distribution service. It should have been its own surface.
+
+**Build the buyer-fairness dashboard before the lifecycle latency one.** Latency is what engineers obsess over. Fairness is what buyers churn over. The dashboard that shows "buyer X has been eligible for 40 leads this week and won 0 of them" is the one that catches real product problems.
+
+## The lesson
+
+Distributing one lead to N buyers is a distributed-systems problem dressed up as a SaaS feature. The naive version works in dev. The correct version requires a ledger, a hold-settle protocol, async fan-out with cancellation safety, and reason-coded telemetry that makes the system explain itself.
+
+Build the ledger first. Everything else gets easier from there.

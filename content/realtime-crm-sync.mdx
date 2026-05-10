@@ -1,0 +1,196 @@
+---
+title: Real-Time Sync from CRM Webhook to Buyer Dashboard in Under a Second
+description: The lead that sits in a buyer's pipeline for ten minutes before they see it is the lead that doesn't close. How I built sub-second sync from a CRM webhook to a multi-tenant buyer dashboard — webhook idempotency, server-sent events, and the failure modes that demos don't show.
+published: 1751544000000
+slug: realtime-crm-sync
+---
+
+A buyer's dashboard is competing with their phone. They're a contractor or a service pro, they're moving between jobs, and the moment a new lead lands they want to know — not in a minute, not after a polling cycle, *now*. The lead that sits in their pipeline for ten minutes before they see it is the lead that doesn't close.
+
+This is the latency budget I built around at LeadSwitchboard: from CRM webhook ingestion to a visible row in the buyer's dashboard, under a second p95. Most of the work isn't where you'd expect. This post walks through the architecture, the idempotency patterns, and the failure modes the demo path never shows.
+
+## The product requirement
+
+A lead is created in the agency's CRM (in our case, Go High Level — GHL). GHL fires a webhook to the platform. The platform decides which buyer the lead routes to (using the [distribution engine](/blog/lead-distribution-engine)), assigns it, and surfaces it in the right buyer's dashboard.
+
+The end-to-end requirement is "fast enough that the buyer never doubts the system is working." In practice that's:
+
+- p50 webhook-to-dashboard: under 400ms
+- p95: under 1s
+- Reliability: zero dropped leads, even under retry storms or intermittent GHL outages
+
+The naive setup — webhook handler writes to DB, dashboard polls every 30 seconds — fails the latency budget by 30x. The next-naive setup — push everything via WebSocket from the webhook handler — fails on reliability the first time a connection drops.
+
+The shape that worked is a hybrid: server-sent events (SSE) for live push, with SWR-driven revalidation as a backstop, and webhook idempotency at the boundary so the system can survive whatever GHL throws at it.
+
+## The webhook flow
+
+The full path:
+
+```
+GHL → POST /leads/webhook/ghl → ingest → eligibility → distribution
+                                                         ↓
+                                         buyer-side state changes
+                                                         ↓
+                                                event published
+                                                  ↙          ↘
+                                            SSE channel    SWR revalidation hint
+                                                  ↓             ↓
+                                          buyer dashboard receives + renders
+```
+
+Each layer has its own concerns:
+
+- **Ingest** is fast and never blocks. Validate signature, dedupe, write a "received" row, return 200. Anything that takes longer than 50ms goes into a background task.
+- **Eligibility + distribution** runs async. The webhook handler doesn't wait for it; it just enqueues the lead and returns. This is essential — GHL's webhook timeout is short, and any slow downstream work (DB lock contention, third-party calls) would cause GHL to retry, which compounds the load.
+- **Event publish** happens after the assignment commits. Same transaction as the assignment row, so if the assignment is rolled back, no event fires.
+- **SSE channel** is per-buyer. Each authenticated buyer connection gets a stream of events scoped to their ID. Backed by Redis pub/sub for fan-out across multiple backend instances.
+- **SWR revalidation** is the fallback. If the SSE channel is closed (network blip, mobile background tab, idle), the next time the buyer's app revalidates, they catch up.
+
+## Idempotency at the webhook boundary
+
+GHL retries on any non-200 response. They retry on timeouts. They occasionally deliver duplicates with no retry signal. The boundary has to be idempotent.
+
+The pattern:
+
+```python
+async def ingest_ghl_webhook(request: Request, db: AsyncSession):
+    # 1. Verify signature (reject malformed at the door)
+    if not verify_ghl_signature(request):
+        return Response(status_code=401)
+
+    payload = await request.json()
+    event_id = payload["eventId"]
+
+    # 2. Idempotency: have we seen this exact event before?
+    existing = await db.execute(
+        select(WebhookEvent).where(
+            WebhookEvent.source == "ghl",
+            WebhookEvent.event_id == event_id,
+        )
+    )
+    if existing.scalar_one_or_none():
+        return Response(status_code=200)  # ack the retry, no work done
+
+    # 3. Record the event row first, then enqueue downstream work
+    event_row = WebhookEvent(
+        source="ghl",
+        event_id=event_id,
+        payload=payload,
+        received_at=now(),
+    )
+    db.add(event_row)
+    await db.commit()
+
+    # 4. Enqueue distribution; return immediately
+    await enqueue_lead_distribution(event_row.id)
+    return Response(status_code=200)
+```
+
+Three details that matter:
+
+- **The signature check is first, even before parsing.** Forged events shouldn't get a row in the events table.
+- **The idempotency check is by `(source, event_id)`.** GHL's event ID is globally unique. The compound key future-proofs us against adding other webhook sources (Stripe, Twilio, etc.) later.
+- **The downstream work is enqueued, not executed.** If distribution itself fails, GHL has already received the 200 — the retry happens via our internal retry, not via GHL re-firing the webhook.
+
+## Server-sent events: simpler than WebSocket, plenty fast
+
+I considered WebSocket for the buyer push. WebSocket is bidirectional, which is more than I need (the dashboard talks to the backend through normal HTTP — only the backend pushes to the dashboard). It also has a heavier connection cost and more complex middleware integration.
+
+SSE is one-way push over a long-lived HTTP response. It's simpler to scale, plays nicely with HTTP/2, and matches the actual traffic shape: the backend has news, the buyer needs to know.
+
+The frontend connects on dashboard mount:
+
+```ts
+useEffect(() => {
+  const source = new EventSource("/api/buyer/events");
+  source.addEventListener("lead.assigned", (e) => {
+    const data = JSON.parse(e.data);
+    mutate("/api/buyer/leads");  // SWR cache invalidation
+  });
+  source.addEventListener("lead.updated", (e) => {
+    mutate(`/api/buyer/leads/${JSON.parse(e.data).leadId}`);
+  });
+  return () => source.close();
+}, []);
+```
+
+Backend side, each connected buyer has a Redis pub/sub subscription scoped to their ID. When an assignment commits, the distribution service publishes:
+
+```python
+await redis.publish(
+    channel=f"buyer:{buyer_id}:events",
+    message=json.dumps({
+        "type": "lead.assigned",
+        "leadId": str(lead.id),
+        "ts": int(time.time()),
+    }),
+)
+```
+
+The connection handler on the receiving instance forwards the message to the buyer's open SSE stream.
+
+## SWR revalidation as the safety net
+
+SSE is fast but not reliable. Connections drop. Mobile tabs go background. The user closes the laptop lid. The browser kills the EventSource for energy reasons.
+
+I treat SSE as a *hint* — a fast notification that something changed — not as a guarantee of delivery. The actual data fetch goes through SWR, which is designed for exactly this pattern:
+
+1. Dashboard mounts, SWR fetches `/api/buyer/leads`
+2. SSE event arrives → call `mutate()` to mark the SWR cache as stale
+3. SWR re-fetches `/api/buyer/leads`, gets fresh data
+4. Component re-renders
+
+If step 2 never happens (because SSE dropped), step 3 still happens via SWR's normal revalidation triggers — focus, mount, interval. The buyer sees the lead a few seconds late instead of instantly. The lead isn't lost; the latency degraded gracefully.
+
+The fallback polling interval is 30 seconds, which I chose because it's the longest delay a buyer is willing to tolerate before suspecting the system is broken. With SSE working, polling is essentially silent. Without SSE, the system is still usable.
+
+## Time-to-seen telemetry
+
+The number that actually matters isn't time-to-DB-write. It's time-to-buyer-saw-it. Those are not the same.
+
+I instrumented both ends of the pipeline:
+
+- Backend records `webhook_received_at`, `assignment_committed_at`, `sse_published_at` per lead.
+- Frontend records `client_received_at` when the SSE event lands, and `client_rendered_at` when the row appears on screen.
+
+The full latency stack ends up as:
+
+```
+total_latency = webhook_received_to_committed
+              + committed_to_published
+              + published_to_client_received
+              + client_received_to_rendered
+```
+
+Tracking each segment separately lets me find regressions precisely. A spike in `committed_to_published` is usually Redis pub/sub backpressure; a spike in `published_to_client_received` is network or SSE proxy buffering; a spike in `client_received_to_rendered` is a frontend render bottleneck.
+
+The dashboard for this is one of the only ones I check daily.
+
+## Failure modes the demo doesn't show
+
+The demo path is happy: webhook fires, assignment commits, SSE delivers, dashboard renders. The failure modes are where the engineering lives.
+
+**The webhook signature is wrong.** GHL changed their signing scheme silently once, mid-pilot. Every webhook started returning 401. The events table accumulated zero rows for two hours before alerting fired. The fix was to add a fast-path metric on signature failures, separately from the success path, so silence was distinguishable from "no traffic." Now if signature failures spike, I see it before the customer does.
+
+**The CRM is down.** GHL has had outages. The platform survives them by design — leads aren't lost, they just arrive late when the CRM recovers. But "the buyer's dashboard hasn't lit up in 20 minutes" looks identical to "our pipeline is broken." A status banner sourced from upstream health checks distinguishes "GHL is degraded, this is expected" from "something on our side is wrong."
+
+**The buyer's tab is in the background.** Mobile browsers throttle SSE in background tabs (some kill the connection entirely). When the buyer foregrounds the tab, they need to catch up fast. SWR's `revalidateOnFocus` handles this — the tab gets visibility, SWR refetches, the dashboard updates. Without that, foregrounded tabs would show stale data for up to 30 seconds.
+
+**The redis pub/sub instance restarts.** Connected SSE channels survive (the connection handler reconnects to Redis). Messages published during the window of the restart are dropped. SWR catches up within the polling interval. The system degrades gracefully because SSE is a hint, not a guarantee.
+
+**Two backend instances both think they own the SSE connection.** Sticky sessions on the load balancer prevent this. Without sticky sessions, the connection bounces between instances and messages get lost. This was a half-day debugging session early on.
+
+## What this teaches about platforms
+
+Real-time sync looks like a single feature. It's actually three:
+
+- **A reliable boundary** that survives upstream retries, signature changes, and outages
+- **A fast push channel** that delivers the happy path under a second
+- **A reliable pull channel** that backstops the push when the network or browser misbehaves
+
+Most teams I've seen build only one of those three. They pick "push" because it's the visible win, build it on WebSocket because they think they need bidirectional, and skip the pull fallback because it works in dev. Then a buyer in the field on flaky LTE never sees their lead and the team spends a sprint debugging "why is real-time broken."
+
+The architecture I'd recommend is the one that already exists in good frontends: a fast hint mechanism (SSE, WebSocket, push notifications — pick whatever fits your stack) layered over a reliable fetch (SWR, React Query, anything cache-aware with revalidation). The hint accelerates the common case. The fetch is the truth.
+
+If you build it that way, the real-time experience feels instant when the network is good and degrades by seconds — not minutes — when it isn't. That's the bar.
