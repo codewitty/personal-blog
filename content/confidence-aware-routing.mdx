@@ -1,0 +1,149 @@
+---
+title: When Not to Trust the AI — Confidence-Aware Routing in Production
+description: At Aurelian we built a conversational AI that handles non-emergency public-safety calls. The most important code in the system is the part that decides not to use it. Here's how we built confidence-aware routing — and what false-confident LLM outputs taught us about the limits of model self-assessment.
+published: 1731412800000
+slug: confidence-aware-routing
+---
+
+When a call comes in to a non-emergency public-safety line, the AI agent has thirty seconds to make a decision that matters: stay on the line and handle it, or hand off cleanly to a human dispatcher.
+
+The wrong decision in either direction is bad. Hand off too aggressively and you're back to the same dispatcher overload the AI was supposed to relieve. Stay on too long, miss a high-stakes intent, and a citizen ends up frustrated, mishandled, or — in the worst case — unsafe.
+
+This is the work I'm most proud of. Not because the AI is good — it is — but because most of the engineering went into making sure the AI knew when *not* to be in the loop. The most important capability of an AI system is knowing when to step out of the way.
+
+This is how we built it.
+
+## The framing
+
+There's a tempting way to frame an AI feature: "the AI handles X% of calls; we'll improve that number over time." Track the number, drive it up, ship.
+
+That framing is wrong, or at least incomplete. What actually matters is what happens to the *other* X%. If the AI handles 80% of calls and the 20% it can't handle drop into a black hole — caller waiting, dispatcher unaware, intent unclear — you haven't built a useful system. You've built a leaky one.
+
+So we flipped the framing: the system's value isn't the 80% the AI handles. It's how cleanly the 20% hands off without dropping a citizen. Make the handoff cheap, fast, and confident, and the rest takes care of itself. Make the handoff slow, ambiguous, or quietly incorrect, and the 80% number is meaningless.
+
+That framing reshapes what you build. You stop optimizing the AI and start optimizing the *boundary* between AI and human.
+
+## The signals
+
+Confidence-aware routing means: on every turn of the conversation, decide whether to keep the AI in the seat or escalate to a human, based on multiple signals — not on the LLM's word alone.
+
+Here are the signals we used.
+
+### 1. LLM output-distribution confidence
+
+When an LLM emits a structured output — a classification, a routing decision, an intent label — the token distribution it sampled from carries information about how certain it was. We logged the top-k logprobs for the relevant tokens and turned them into a per-decision confidence score.
+
+This is the cheapest signal to add and the easiest one to over-trust. More on that later.
+
+### 2. Intent classifier (separate from the agent)
+
+Some intents are always escalated, period. "I'm having a medical emergency" is not a non-emergency intent, even if the caller misdialed. We ran a separate, deterministic classifier over the rolling transcript — not the agent itself — to flag high-stakes intents. The classifier had one job: decide whether the call belonged in this AI's bucket at all.
+
+The classifier was tuned to high recall, low precision. We'd rather escalate a few false positives to a dispatcher than miss a real one.
+
+### 3. Jurisdictional config (GIS-aware)
+
+Public safety in the US is wildly fragmented. An agency in Seattle might allow the AI to take noise complaints; the one next door might not. An agency might disable AI handling entirely on certain incident types per their own protocol.
+
+We backed this with PostgreSQL + PostGIS: every agency had a polygon (or set of polygons) for its jurisdiction, plus a config that said which incident types and intents were AI-eligible. When the call routed in, we mapped caller location → jurisdiction → AI eligibility before the agent even started talking. If the answer was "no," the AI politely greeted and routed straight to a dispatcher.
+
+This was the most boring part of the system and the one that prevented the most issues. Configuration as a routing primitive is underrated.
+
+### 4. Audio cues
+
+The speech provider gave us emotional-tone signals — distress, anger, urgency — derived from prosody. We didn't trust them on their own (they're noisy), but elevated tone on a borderline call would tip the balance toward escalation.
+
+We treated audio cues as a multiplier on other signals, never the only signal. Distress in someone's voice while reporting a parking complaint might just be how they talk. Distress while reporting a missing person was an immediate escalation regardless of what the LLM thought.
+
+### 5. Soft timer
+
+Calls have a natural rhythm. A non-emergency intake should converge in roughly 90 seconds. If we hit 120, something was off — either the call was harder than the AI expected, or we were stuck. We escalated regardless. Better a confused dispatcher who picks up a half-finished intake than an indefinitely-stuck citizen.
+
+### 6. The "I don't know" signal
+
+We taught the agent to say "I don't have that information" or "let me get a dispatcher on the line." When it produced one of those phrases, that itself was a routing signal — escalation triggered automatically on the next turn. The model didn't have to *also* set a flag; the natural-language admission was the flag.
+
+## Decision policy as code, not as prompt
+
+Here's the architectural choice that mattered most: the routing policy is *deterministic code*, not a prompt. The agent's prompt focuses on conversation. A separate, well-tested policy layer reads all the signals above and decides — yes / no / escalate / wait — on every turn.
+
+```python
+def should_escalate(turn: Turn, state: ConversationState) -> RoutingDecision:
+    # Deterministic gates first
+    if state.intent_classifier.detected_high_stakes():
+        return RoutingDecision.escalate(reason="high_stakes_intent")
+
+    if not state.jurisdiction.ai_enabled_for(state.detected_incident_type):
+        return RoutingDecision.escalate(reason="agency_policy")
+
+    if state.elapsed_seconds > SOFT_TIMER_LIMIT_S:
+        return RoutingDecision.escalate(reason="timeout")
+
+    if turn.agent_said_idk():
+        return RoutingDecision.escalate(reason="agent_admission")
+
+    # Then probabilistic signals
+    distress = state.audio.distress_score
+    confidence = turn.llm_decision_confidence
+    if distress > DISTRESS_THRESHOLD and confidence < CONFIDENT_FLOOR:
+        return RoutingDecision.escalate(reason="distress_low_confidence")
+
+    if confidence < HARD_FLOOR:
+        return RoutingDecision.escalate(reason="model_uncertain")
+
+    return RoutingDecision.continue_()
+```
+
+Why code instead of prompt:
+
+- **Testable.** Every routing decision goes through a unit test suite. We can write a regression test for "this exact call shape must always escalate" and have it block deploys.
+- **Auditable.** When a call is reviewed, we can show the exact signal values and the exact branch the policy took. "The AI decided X" is replaced by "the policy escalated because the intent classifier detected a high-stakes signal at confidence 0.94 and the jurisdiction allowed AI handling for this type." Specific. Defensible.
+- **Tunable.** Thresholds are config, not weights. We can adjust <Snippet>DISTRESS_THRESHOLD</Snippet> per agency, time of day, or specific incident type without touching the model.
+- **Governable.** Compliance and dispatch leadership can review policy changes the same way they review software changes — code review, change history, sign-off.
+- **Plugged into the eval harness.** The policy fires through the same eval framework I wrote about [in the previous post](/blog/prompt-observability-console). We can run the entire policy against thousands of canonical calls in CI and catch regressions before deploy.
+
+If the policy lives inside a prompt, you lose all of the above. The agent might "remember to escalate" most of the time, but you can't test it, you can't audit it, and you can't tune it without retraining.
+
+## The thing nobody talks about: false-confident LLM outputs
+
+Here's the part of building reliable AI that nobody writes about: LLMs can be very confidently wrong.
+
+You ask the model to classify an intent. It returns a single, clean answer. The token logprobs are tight — the model is "certain." You log the confidence score, route on it, and ship.
+
+Then you discover, three weeks in, that for a specific class of inputs the model is *consistently* certain about the wrong answer. Not "right 90% of the time, slightly uncertain on the other 10%" — confidently wrong, every single time, on the same kind of input.
+
+The token-distribution confidence wasn't measuring what we thought it was measuring. It was measuring how much the model had already committed to a path, not how good the path was. A model with high pretraining priors on a misleading correlation will generate confident, wrong answers all day long.
+
+We caught this when a dispatch trainer flagged it through the [Retool review queue](/blog/prompt-observability-console). She noticed a pattern in the *non-*escalations: the AI was confidently handling a class of complaints that should have routed to a different agency entirely, because the original agency had transferred jurisdiction six months prior and our config hadn't been updated. The model had no way of knowing that. And it was certain it should keep handling them.
+
+Three lessons from this:
+
+**1. LLM confidence is necessary but not sufficient.** Always pair it with at least one independent signal — a separate classifier, a deterministic check, a human-in-the-loop sample. If you build routing decisions purely on the model's self-reported certainty, you will ship hidden bugs.
+
+**2. Treat patterns of high-confidence agreement as a smell.** If the model is *always* certain on a class of inputs, ask why. The certainty might be real signal. It might be the model agreeing with itself for the wrong reasons.
+
+**3. Sample for review, even on "confident" cases.** Our review queue prioritized uncertain cases. We added a low-rate audit channel that pulled high-confidence cases at random. That audit caught more problems than we expected.
+
+## What this teaches about AI platforms
+
+A platform's job is to make handoff cheap. That's it.
+
+If your platform makes it easy to put an LLM in the loop but hard to take it out, you've built something dangerous. If your platform measures inference latency but not handoff latency, you've measured the wrong thing. If your platform's UI shows "the AI handled this call" without showing *why it didn't escalate*, you can't audit your own system.
+
+The shape of a good AI platform isn't "make AI calls fast." It's:
+
+- **A boundary layer** between AI and human, controllable by code
+- **First-class telemetry** for routing decisions, not just inference
+- **An audit trail** that explains every keep-the-AI-in-the-loop decision
+- **A test harness** that exercises the boundary, not just the model
+- **A pressure-relief valve** that any operator can pull at any time
+
+Most teams building "AI platforms" today are building inference platforms. The actual platform — the one that makes AI deployable in domains where being wrong has consequences — sits one layer above.
+
+## Closing
+
+The AI we shipped at Aurelian handles four out of five non-emergency calls end-to-end. The one out of five it doesn't handle is what makes the system trustworthy. The work that made that handoff fast and clean was unglamorous, untweetable, and the most senior engineering on the project.
+
+If you're building production AI, the question isn't how to make the model better. It's how to know — quickly, cheaply, and reliably — when the model is the wrong tool for the moment in front of you.
+
+That's the platform. Build that.
