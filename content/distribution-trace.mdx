@@ -9,17 +9,15 @@ A while back I [wrote about the lead distribution engine](/blog/lead-distributio
 
 This one is about a question the engine couldn't answer: *why did it decide that?*
 
-Because the failure mode that actually generates support tickets isn't "the engine crashed." It's a buyer calling to say "I should have gotten that lead — it's in my zip, my balance is fine, why didn't it come to me?" And the honest answer, for a long time, was: I don't know. The engine made a dozen branching decisions in under a second and returned a single word — `distributed`, or `failed` — with a one-line reason if you were lucky. Everything in between was gone.
+Because the failure mode that generates support tickets isn't "the engine crashed." It's a buyer calling to say "I should have gotten that lead — it's in my zip, my balance is fine, why didn't it come to me?" And the honest answer, for a long time, was: I don't know. The engine made a dozen branching decisions in under a second and returned a single word — `distributed`, or `failed` — with a one-line reason if you were lucky. Everything in between was gone.
 
 So I built a trace.
 
 ## The shape of the problem
 
-Distribution is a decision tree, not a straight line. A lead comes in and the engine resolves a campaign, prices it, composes a pool of enrolled buyers, filters that pool by service area and onboarding answers, ranks what survives, locks credit balances, and assigns. Every one of those steps can end the journey: the campaign has no enrolled buyers, every buyer was filtered out by geography, the lead failed a tier's content filter, a credit lock timed out.
+Distribution is a decision tree, not a straight line. A lead comes in and the engine resolves a campaign, prices it, composes a pool of enrolled buyers, filters that pool by service area and onboarding answers, ranks what survives, locks credit balances, and assigns. Every step can end the journey: no enrolled buyers, everyone filtered out by geography, the lead failed a tier's content filter, a credit lock timed out.
 
-The old logging told me the *outcome* of that tree. What I needed was the *path through it* — for one specific lead, on one specific attempt, which branch did we take at each fork, and why.
-
-The constraints made it interesting:
+The old logging told me the *outcome* of that tree. What I needed was the *path through it* — for one lead, on one attempt, which branch we took at each fork, and why. The constraints made it interesting:
 
 - **It has to be per-attempt.** A lead can be distributed more than once — a retry after a transient failure, a manual re-assign by an operator. "Why didn't buyer X get it" is meaningless without knowing *which* run you're asking about.
 - **It can never slow down or break distribution.** This is observability bolted onto the revenue-critical path. If the trace write fails, the lead still has to go out. Tracing that can break the thing it traces is worse than no tracing.
@@ -42,7 +40,7 @@ gated_for_verification
 ping_post_opened
 ```
 
-Each row carries typed columns for the things I query on — `buyer_id`, `cost`, `outcome`, `skip_reason`, `duration_ms` — plus a `data` JSONB blob for the step-specific detail that isn't worth a column. Every row is stamped with the `attempt_id`, so a trace is just *all rows for one attempt, in order*. Read top to bottom, it's the engine narrating its own decision.
+Each row carries typed columns I query on — `buyer_id`, `cost`, `outcome`, `skip_reason`, `duration_ms` — plus a `data` JSONB blob for step-specific detail not worth a column. Every row is stamped with the `attempt_id`, so a trace is just *all rows for one attempt, in order*: the engine narrating its own decision.
 
 The recorder is deliberately boring:
 
@@ -64,11 +62,11 @@ def _record_distribution_event(db, *, lead_id, agency_id, attempt_id, event, **f
 
 Two design decisions are doing all the work here, and they pull in opposite directions.
 
-**It writes on the caller's transaction.** I don't flush, I don't commit — I just `add` the row to whatever session the distribution work is already using. That makes the trace *atomic with the work it describes*. If the assignment commits, its trace commits with it. If the assignment rolls back, the trace rolls back too. A trace that says "buyer selected, lead assigned" for an assignment that never actually committed would be a liar, and a lying trace is worse than none.
+**It writes on the caller's transaction.** I don't flush or commit — I just `add` the row to whatever session the distribution work is already using. That makes the trace *atomic with the work it describes*: if the assignment commits, its trace commits with it; if the assignment rolls back, so does the trace. A trace that says "buyer selected, lead assigned" for an assignment that never committed would be a liar, and a lying trace is worse than none.
 
-**It swallows everything.** The whole body is wrapped in a `try/except` that only logs. Tracing sits on the revenue path; it gets zero votes on whether a lead goes out. A malformed `data` payload or a bad identifier can't be allowed to take down a distribution. (The `except` block even re-`repr`s the identifiers inside their own `try`, so a pathological `lead_id` can't re-enter the handler and throw again.)
+**It swallows everything.** The body is wrapped in a `try/except` that only logs. Tracing sits on the revenue path; it gets zero votes on whether a lead goes out. A malformed `data` payload or a bad identifier can't be allowed to take down a distribution.
 
-That second decision is uncontroversial. The first one — atomicity with the caller's transaction — is the one that had a bug hiding in it.
+That second decision is uncontroversial. The first — atomicity with the caller's transaction — is the one that had a bug hiding in it.
 
 ## Bug one: the trace vanishes exactly when you need it
 
@@ -76,9 +74,9 @@ Here's the failure that prompted all of this. A lead comes in, the engine starts
 
 And rolling back the transaction throws away every trace row written during it.
 
-So the operator opens the lead, looks at the distribution drawer to find out what happened, and sees *nothing*. The trace is emptiest precisely in the case where someone is most likely to come asking — a lead that mysteriously didn't go out. The atomicity that keeps the trace honest also means a rollback erases the evidence.
+So the operator opens the lead, looks at the distribution drawer, and sees *nothing*. The trace is emptiest precisely when someone is most likely to come asking — a lead that mysteriously didn't go out. The atomicity that keeps the trace honest also lets a rollback erase the evidence.
 
-The fix is to recognize that a terminal failure is *different* from the in-flight steps. The in-flight steps (`buyer_pool_composed`, `pricing_computed`) genuinely should die with a rollback — they describe work that didn't happen. But the *fact that the lead failed, and why* is true regardless of the rollback. That fact needs to outlive the transaction.
+The fix is to recognize that a terminal failure is *different* from the in-flight steps. The in-flight steps (`buyer_pool_composed`, `pricing_computed`) should die with a rollback — they describe work that didn't happen. But the *fact that the lead failed, and why* is true regardless. That fact needs to outlive the transaction.
 
 So terminal failures on a rolled-back path get written on a **fresh session**:
 
@@ -106,19 +104,17 @@ async def _emit_failure_trace_fresh(self, *, lead_id, attempt_id, skip_reason, d
         logger.exception("distribution_failure_trace_persist_failed", ...)
 ```
 
-This deliberately breaks the atomicity rule — and that's the point. The general events ride the transaction so they can't lie about work that rolled back. The terminal failure breaks out of the transaction because a rolled-back distribution still *happened*, and the operator needs the record of why.
+This deliberately breaks the atomicity rule — and that's the point. The general events ride the transaction so they can't lie about work that rolled back; the terminal failure breaks out of it because a rolled-back distribution still *happened*, and the operator needs the record of why.
 
-The best-effort swallow matters more than it looks. This runs *after* the caller already rolled back. The lead row might not be committed yet; it might have been deleted concurrently, in which case the foreign key rejects the trace insert. If I let that fresh-session error propagate, it would surface as a generic 500 and *mask the real distribution outcome* — I'd be reporting a database error instead of "this lead lost a credit lock and will retry." So the failure-trace write, the thing whose entire job is to explain what happened, must never become the thing that obscures it.
+The best-effort swallow matters more than it looks. This runs *after* the caller rolled back. The lead row might not be committed yet, or might have been deleted concurrently, in which case the foreign key rejects the insert. Let that error propagate and it surfaces as a generic 500 that *masks the real outcome* — a database error instead of "this lead lost a credit lock and will retry." The write whose entire job is to explain what happened must never become the thing that obscures it.
 
 ## Bug two: a transient label on a permanent failure
 
-The same change fixed a subtler bug, and this one wasn't about the trace plumbing — it was about telling the truth in the `skip_reason`.
+The same change fixed a subtler bug — not in the trace plumbing, but in telling the truth in the `skip_reason`.
 
-When the buyer pool comes back empty, the engine has to classify *why*, because the classification decides what happens next. A **transient** failure (`no_enrolled_buyers_transient`) means "try again in a moment" — the lead goes back on the retry path. A **permanent** failure (`no_enrolled_buyers`, `no_eligible_buyers`) means "stop; a human needs to fix the config" — the lead surfaces to an operator.
+When the buyer pool comes back empty, the engine has to classify *why*, because the classification decides what happens next. A **transient** failure (`no_enrolled_buyers_transient`) means "try again in a moment" — back on the retry path. A **permanent** failure (`no_enrolled_buyers`, `no_eligible_buyers`) means "stop; a human needs to fix the config" — surface it to an operator. Get that wrong in either direction and you either retry forever against a campaign that will never have an eligible buyer, or park a perfectly distributable lead for manual review.
 
-Get that classification wrong and you get one of two bad outcomes: a permanent gap gets labeled transient and the lead retries forever against a campaign that will never have an eligible buyer, or a transient blip gets labeled permanent and a perfectly distributable lead gets parked for manual review.
-
-The old code had the first bug. For round-robin campaigns, when the pool came back empty it would count the campaign's *total active enrollments*, and if that count was greater than zero, call the failure transient — "buyers exist, they must all be locked, retry." But that count was campaign-wide. It happily counted buyers who had been filtered out by service area or onboarding answers — buyers who were never going to be eligible for *this* lead. A campaign full of buyers who don't cover the lead's zip would get flagged "all locked, transient" and the lead would retry against a wall.
+The old code had the first bug. For round-robin campaigns, when the pool came back empty it counted the campaign's *total active enrollments*, and if that was greater than zero, called the failure transient — "buyers exist, they must all be locked, retry." But that count was campaign-wide. It happily counted buyers filtered out by service area or onboarding answers — buyers who were never eligible for *this* lead. A campaign full of buyers who don't cover the lead's zip got flagged "all locked, transient" and the lead retried against a wall.
 
 The fix classifies by *which filter emptied the pool*:
 
@@ -146,24 +142,24 @@ else:
     failure_reason = "no_enrolled_buyers"                     # campaign genuinely has nobody
 ```
 
-The key move: genuine lock contention now has its *own* exception (`_TierLockContention`) raised from the selection loop and handled separately — that's the one truly transient path, and it's the one that gets the fresh-session failure trace from bug one. By the time control reaches *this* block, we know the empty pool is **not** a locking problem. It's a permanent gap, and the only question left is which filter caused it: a content filter rejecting the lead, a service-area / onboarding pre-filter removing every enrolled buyer, or a campaign with nobody enrolled at all. Three different conversations with the operator, three different `skip_reason`s in the trace.
+The key move: genuine lock contention now has its *own* exception (`_TierLockContention`), raised from the selection loop and handled separately — the one truly transient path, and the one that gets the fresh-session failure trace from bug one. By the time control reaches *this* block, the empty pool is **not** a locking problem; it's a permanent gap, and the only question is which filter caused it. Three filters, three different conversations with the operator, three different `skip_reason`s in the trace.
 
 This is the whole reason the trace exists. "No eligible buyers" is a useless answer to a buyer's question. "Every enrolled buyer was removed by the service-area filter because none of them cover 30312" is an answer the operator can act on — go enroll a buyer who covers that zip.
 
 ## Surfacing it where the question gets asked
 
-A trace nobody reads is just an expensive log. The events land in the lead's detail drawer in the admin UI, rendered in order — the same drawer where I also surfaced the lead's campaign and state, because "which campaign was this even routing through" turned out to be the first question every trace investigation started with.
+A trace nobody reads is just an expensive log. The events land in the lead's detail drawer in the admin UI, rendered in order — the same drawer where I also surfaced the lead's campaign and state, because "which campaign was this even routing through" turned out to start every investigation.
 
-So now the flow is: buyer asks "why didn't I get it," operator opens the lead, reads the trace top to bottom. `distribution_started` → `campaign_resolved` → `buyer_pool_composed` → and then a `failed` row with `skip_reason: no_eligible_buyers` and a `data` blob showing eight enrolled buyers, zero surviving the service-area filter. Answer found in fifteen seconds, no engineer involved.
+So now: buyer asks "why didn't I get it," operator opens the lead, reads the trace top to bottom. `distribution_started` → `campaign_resolved` → `buyer_pool_composed` → a `failed` row with `skip_reason: no_eligible_buyers` and a `data` blob showing eight enrolled buyers, zero surviving the service-area filter. Answer in fifteen seconds, no engineer involved.
 
 ## What this taught me about tracing
 
 Three things I'd carry to any system where a fast, branching decision needs to be explainable after the fact:
 
-**A trace is bound to an attempt, a log is bound to a moment.** The single most useful column in the whole table is `attempt_id`. It's what turns scattered rows into a story you can read end to end. Logs tell you what was happening at 14:32:07; a trace tells you what happened to *this lead on this run*. The product question is always the second kind.
+**A trace is bound to an attempt; a log is bound to a moment.** The most useful column in the table is `attempt_id` — it's what turns scattered rows into a story you can read end to end. Logs tell you what was happening at 14:32:07; a trace tells you what happened to *this lead on this run*. The product question is always the second kind.
 
-**Atomicity is a feature until the failure path needs an exception.** Riding the caller's transaction is exactly right for events describing work that might roll back — it keeps the trace from lying. But the record of *why something failed* has to outlive the rollback that caused it, which means deliberately, carefully, breaking the rule for that one case. Knowing which events are "part of the work" and which are "the verdict on the work" is the whole design.
+**Atomicity is a feature until the failure path needs an exception.** Riding the caller's transaction is right for events describing work that might roll back — it keeps the trace from lying. But the record of *why something failed* has to outlive the rollback that caused it, which means deliberately breaking the rule for that one case. Knowing which events are "part of the work" and which are "the verdict on the work" is the whole design.
 
-**The classification is the product, not the plumbing.** I could have built every bit of the event table perfectly and still shipped a useless feature, because the value isn't in *having* a `skip_reason` — it's in the `skip_reason` being *true*. A trace that confidently says "transient, retrying" about a permanent coverage gap is worse than silence, because now someone trusts it. The engineering that matters most in an observability feature is the part that decides what to call things.
+**The classification is the product, not the plumbing.** I could have built the event table perfectly and still shipped a useless feature, because the value isn't in *having* a `skip_reason` — it's in its being *true*. A trace that confidently says "transient, retrying" about a permanent coverage gap is worse than silence, because now someone trusts it. The engineering that matters most in an observability feature is the part that decides what to call things.
 
 The distribution engine answers "where does this lead go." The trace answers "why" — and the second question, it turns out, is the one that was costing me afternoons.
