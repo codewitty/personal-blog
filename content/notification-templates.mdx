@@ -1,0 +1,159 @@
+---
+title: "Letting Customers Edit the Emails You Send on Their Behalf"
+description: A multi-tenant platform sends buyer-facing emails in each agency's name — so each agency wants its own words. The moment you let customers author content that runs inside your send path, every send grows a new failure mode. Here's the notification-template system I built, and why the real work is the ladder of fallbacks, not the editor.
+published: 1752753600000
+slug: notification-templates
+---
+
+LeadSwitchboard sends a lot of email *on behalf of* its agencies. When a buyer is invited, when a lead lands, when a credit balance runs low, the message goes out in the agency's name, with the agency's brand on it. So the agencies want their own words in it — their tone, their phrasing, their subject lines.
+
+For a long time those emails were hardcoded HTML strings sitting in `email_service.py`. One voice, mine, baked into the platform. The fix sounds simple — "let agencies edit the templates" — and it is, right up until you remember that you're now letting customers author content that runs inside your transactional send path. Every send just grew a new failure mode: a broken template, a typo'd variable, a customer who turned the email off and a code path that "helpfully" sends the default anyway.
+
+This is the system that makes that safe. The interesting part isn't the editor — it's the ladder of fallbacks underneath it.
+
+## Three states, not two
+
+A notification template is keyed by `(agency_id, notification_type, channel)` — so a given agency's `buyer_invite` email is one row, its `lead_assignment` SMS is another. There's an optional `campaign_id` for per-campaign overrides on top of the agency default.
+
+The naive model is "custom template or built-in default" — two states. The real model has three, and the third is the one that bites you:
+
+- **A custom template exists and is enabled** → render it.
+- **No template row exists** → fall back to the hardcoded default.
+- **A template row exists but is disabled** → send *nothing*.
+
+That last one is a distinct state, not a flavor of "no template." If an agency explicitly turns off the low-balance email, falling back to the built-in default is the worst possible behavior — you'd be re-sending the exact thing they disabled. So suppression has to short-circuit *before* the fallback:
+
+```python
+def is_notification_suppressed(db, agency_id, notification_type, channel, *, campaign_id=None) -> bool:
+    """A suppressed notification has a row with enabled=False. The caller should
+    skip the send entirely — do NOT fall back to the hardcoded default."""
+    row = _effective_template_row(db, agency_id, notification_type, channel, campaign_id)
+    return row is not None and row.enabled is False
+```
+
+Every call site checks suppression first, *then* tries to render, *then* falls back. "Off" has to mean off, even though "off" and "absent" look almost identical in the data.
+
+## Resolving which template wins
+
+Lookup resolves by precedence — campaign-specific override first, agency default second:
+
+```python
+def _effective_template_row(db, agency_id, notification_type, channel, campaign_id):
+    """campaign-specific override (when campaign_id is set) → agency default
+    (campaign_id IS NULL). Returns None when neither exists."""
+    if campaign_id is not None:
+        row = db.execute(select(...).where(..., campaign_id == campaign_id)).scalar_one_or_none()
+        if row is not None:
+            return row
+    # fall through to the agency-wide default (campaign_id IS NULL)
+    ...
+```
+
+Everything is scoped by `agency_id`, always — that's the multi-tenant boundary, and it's not optional on any path. The precedence is just sugar on top: a campaign can override its agency's default, but it can never reach another agency's templates.
+
+Which `notification_type`s are even allowed lives in a database `CHECK` constraint, not application code:
+
+```sql
+CHECK (notification_type IN (
+  'lead_assignment','credit_low','credit_critical',
+  'dispute_approved','dispute_denied','buyer_verified',
+  'ping_post_available','buyer_invite'))
+```
+
+I like the constraint better than an app-level enum because it keeps junk types out of the table at the lowest level — a bug that tries to write `buyer_invtie` fails at the database, not three weeks later when nobody can figure out why that email never renders. The cost is that adding a type is a migration. That's the right trade: a new notification type is a deliberate act, and the migration's `downgrade` even deletes any `buyer_invite` rows *before* dropping them from the constraint, so the rollback can't strand rows the constraint would reject.
+
+## Rendering a template a stranger wrote
+
+The templates are Jinja2. Customer-authored Jinja2, rendering in production, in the path of a transactional email. Two things have to be true: a broken template can never crash a send, and a template can never reach past the variables it's handed.
+
+The first is a custom undefined type:
+
+```python
+class _ChompUndefined(Undefined):
+    """Renders missing variables as empty string so a typo doesn't crash a send.
+    Attribute/item access returns another _ChompUndefined so chained expressions
+    like {{ user.name }} don't raise."""
+    def __str__(self): return ""
+    def __getattr__(self, name): return _ChompUndefined()
+    def __getitem__(self, key): return _ChompUndefined()
+```
+
+Jinja's default behavior on `{{ acccept_url }}` (note the typo) is to raise at render time. In a web page that's a 500 you'd notice. In a fire-and-forget email send it's a notification that silently never goes out. `_ChompUndefined` renders the typo as empty string and keeps going — and because attribute and item access return another chomp-undefined, even `{{ user.profile.name }}` against a missing `user` degrades to blank instead of throwing.
+
+Missing variables degrade silently. But a *syntactically* broken template — `{{ agency_name }` with the brace dropped — can't be rendered at all, and that's where the fallback ladder kicks in:
+
+```python
+def _render_string(template_str, context, *, field, row_id) -> Optional[str]:
+    try:
+        return _JINJA_ENV.from_string(template_str).render(**context)
+    except TemplateSyntaxError as exc:
+        logger.error("notification_template_syntax_error", extra={"template_id": row_id, ...})
+        return None        # caller falls back to the built-in default
+    except Exception as exc:
+        logger.error("notification_template_render_error", ...)
+        return None
+```
+
+A `None` body means "this template is broken, use the hardcoded default." But subject and body fail independently, and they shouldn't share a fate — a broken subject line is no reason to throw away a perfectly good body:
+
+```python
+body = _render_string(row.body, context, field="body", row_id=row.id)
+if body is None:
+    return None                      # body broken → whole template falls back
+subject = None
+if row.subject:
+    subject = _render_string(row.subject, ...)
+    if subject is None:              # subject broken → drop custom subject, keep body
+        logger.warning("notification_template_subject_syntax_error_ignored", ...)
+```
+
+So the failure ladder, top to bottom: missing variable → blank. Broken subject → keep the body, use the default subject. Broken body → discard the whole custom template, send the built-in default. Disabled → send nothing. Every rung degrades to something that still works, and every non-trivial failure gets logged so I can see which agency's template is broken without a customer having to tell me.
+
+This is the same instinct as the [distribution trace](/blog/distribution-trace): the observability — or here, the customization — sits on a critical path, so it gets zero votes on whether the underlying thing succeeds. A template can change what the email says. It can never stop the email from being sent.
+
+## Escaping at the boundary
+
+The Jinja environment runs with `autoescape=False`, which looks alarming for customer-authored content until you see where the escaping actually happens. The template body is plain text — no HTML. When a rendered body gets dropped into the branded email shell, it's escaped line by line at that boundary:
+
+```python
+_escaped_lines = "<br>".join(escape(line) for line in _tmpl.body.splitlines())
+html = _email_container(f'<p style="...">{_escaped_lines}</p>')
+```
+
+Customers write words; the platform owns the markup. An agency can't inject a `<script>` or a tracking pixel through their invite copy, because every line they wrote is escaped before it touches the HTML. They author *text*; the platform supplies the chrome.
+
+## What adding a notification type looks like now
+
+The whole point of the system is that the next notification type isn't a project. When I converted the buyer-invite email from a hardcoded HTML block into a customizable template, the change was four small pieces:
+
+1. A migration adding `buyer_invite` to the `CHECK` constraint.
+2. A `TEMPLATE_VARIABLE_DOCS` entry — `agency_name`, `accept_url`, `expires_in_days` — which is also what the admin UI shows the agency as "variables you can use."
+3. A `DEFAULT_TEMPLATES` entry, so there's a sensible built-in even before anyone customizes.
+4. One call site swapping its hardcoded HTML for *suppress-check → render-or-None → fall back*.
+
+That call site is the whole pattern in miniature:
+
+```python
+if is_notification_suppressed(db, agency_id, "buyer_invite", "email"):
+    return False                                  # off means off
+tmpl = render_notification_template(db, agency_id, "buyer_invite", "email", ctx)
+if tmpl is not None:
+    subject = tmpl.subject or default_subject     # rendered, or fall back per-field
+    html = _email_container(escaped(tmpl.body))
+else:
+    subject, html = default_subject, hardcoded_invite_html   # broken or absent → built-in
+```
+
+The documented variables matter more than they look. They're a contract: this is the data this email has access to, and nothing else. The agency editing their invite copy sees exactly `agency_name`, `accept_url`, `expires_in_days` — not the lead's PII, not another buyer's details, not the internals of the send. The template can only reach what the call site chose to hand it.
+
+## What this taught me about customizability
+
+Three things I'd carry to any feature that lets customers author content that runs in your pipeline:
+
+**Customizability is a reliability problem wearing a product hat.** The visible feature is a template editor. The actual feature is the guarantee that nothing a customer types into it can cost them a notification. Most of the code is fallbacks, not editing.
+
+**"Off" is a real state, and it's not "default."** The single subtlest bug in this whole area would have been treating a disabled template as an absent one and cheerfully sending the built-in version of the thing the customer explicitly silenced. Suppression has to be its own branch, checked before fallback, every time.
+
+**Degrade per-field, not per-template.** A broken subject shouldn't kill a working body; a missing variable shouldn't kill anything. The more independently each piece can fail and recover, the more often a half-broken template still produces a usable email instead of a missed one.
+
+The hardcoded version sent one good email in one voice. The template version sends a *usually-customized, occasionally-broken, always-delivered* email in whatever voice the agency wants — and the difference between "occasionally broken" and "occasionally missed" is the entire ladder.
