@@ -43,7 +43,7 @@ Each layer has its own concerns:
 
 - **Ingest** is fast and never blocks. Validate signature, dedupe, write a "received" row, return 200. Anything over 50ms goes into a background task.
 - **Eligibility + distribution** runs async. The webhook handler enqueues the lead and returns without waiting. This is essential: GHL's webhook timeout is short, and any slow downstream work (DB lock contention, third-party calls) would cause GHL to retry, which compounds the load.
-- **Event publish** happens after the assignment commits. Same transaction as the assignment row, so if the assignment rolls back, no event fires.
+- **Event publish** is staged in the same transaction as the assignment row and goes out from an `after_commit` hook, so if the assignment rolls back, no event fires.
 - **SSE channel** is per-buyer. Each authenticated buyer connection gets a stream of events scoped to their ID. Redis pub/sub handles fan-out across backend instances.
 - **SWR revalidation** is the fallback. If the SSE channel closes (network blip, mobile background tab, idle), the buyer catches up on the next revalidation.
 

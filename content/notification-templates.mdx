@@ -78,7 +78,7 @@ class _ChompUndefined(Undefined):
     def __getitem__(self, key): return _ChompUndefined()
 ```
 
-Jinja's default behavior on `{{ acccept_url }}` (note the typo) is to raise at render time. In a web page that's a 500 you'd notice. In a fire-and-forget email it's a notification that silently never goes out. `_ChompUndefined` renders the typo as empty string and keeps going. Even `{{ user.profile.name }}` against a missing `user` degrades to blank instead of throwing.
+Stock Jinja renders a bare typo like `{{ acccept_url }}` as an empty string, but chained access like `{{ user.profile.name }}` against a missing `user` raises at render time. In a web page that's a 500 you'd notice. In a fire-and-forget email it's a notification that silently never goes out. `_ChompUndefined` makes both degrade to blank and keeps going.
 
 A *syntactically* broken template, like `{{ agency_name }` with the brace dropped, can't render at all. That's where the fallback ladder kicks in:
 
