@@ -1,24 +1,24 @@
 ---
-title: Use a user-specified service account to trigger a GCP cloudbuild job.
-description: Learn how to enhance GCP Cloud Build security with custom service accounts. Step-by-step Terraform and GitHub Actions CI/CD guide.
+title: Use a user-specified service account to trigger a GCP cloudbuild job
+description: Tighten GCP Cloud Build security with custom service accounts. A step-by-step Terraform and GitHub Actions CI/CD guide.
 published: 1708804800000
 slug: cloudbuild-sa
 ---
 
-In a move towards enhanced security and granular control, Google Cloud Platform (GCP) has recently shifted its Cloud Build service away from the default service account.  This change encourages users to specify custom service accounts when triggering builds, empowering you to enforce least-privilege principles and tighten your CI/CD pipeline&apos;s security posture. In this blog post, I will guide you through configuring custom service accounts for Cloud Build using Terraform and YAML files within the robust GitHub Actions CI/CD framework.
+Google Cloud Platform (GCP) has recently moved its Cloud Build service away from the default service account, for tighter security and more granular control. GCP now encourages you to specify a custom service account when you trigger builds, so you can enforce least privilege in your CI/CD pipeline. In this post I'll walk through configuring custom service accounts for Cloud Build using Terraform and YAML files in a GitHub Actions pipeline.
 
 ## Prerequisites
 
 - A Google Cloud Platform account with billing enabled.
 - Terraform installed on your machine.
 - A service account with the necessary permissions to trigger a cloudbuild job.
-- A Github account.
+- A GitHub account.
 
 ## Setup
 
 ### Step 1: Enable the Cloud Build API
 
-Navigate to the [Cloud Build API](https://console.cloud.google.com/apis/library/cloudbuild.googleapis.com) and enable it.
+Enable the [Cloud Build API](https://console.cloud.google.com/apis/library/cloudbuild.googleapis.com).
 
 ### Step 2: Create a service account
 
@@ -51,13 +51,13 @@ gcloud iam service-accounts keys create [KEY_FILE] \
 
 ```
 
-### Step 5: Store the key in Github secrets
+### Step 5: Store the key in GitHub secrets
 
-Navigate to your Github repository and go to <Snippet>Settings</Snippet> > <Snippet>Secrets</Snippet> and add the key as a secret.
+In your GitHub repository, go to <Snippet>Settings</Snippet> > <Snippet>Secrets</Snippet> and add the key as a secret.
 
 ### Step 6: Create a cloudbuild.yaml file
 
-Create a <Snippet>cloudbuild.yaml</Snippet> file in the root of your repository with the following content.
+Create a <Snippet>cloudbuild.yaml</Snippet> file in the root of your repository.
 
 ```yaml
 
@@ -87,9 +87,9 @@ steps:
 
 ```
 
-### Step 7: Create a Github workflow
+### Step 7: Create a GitHub workflow
 
-Create a <Snippet>.github/workflows/main.yml</Snippet> file in the root of your repository with the following content.
+Create a <Snippet>.github/workflows/main.yml</Snippet> file in the root of your repository.
 
 ```yaml
 
@@ -101,29 +101,27 @@ on:
       - main
 
 jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
 
-    trigger:
-        runs-on: ubuntu-latest
-        steps:
-        - name: Checkout
-            uses: actions/checkout@v2
-    
-        - name: Set up gcloud
-            uses: google-github-actions/setup-gcloud@v0.2.0
-            with:
-            service_account_key: ${{ secrets.SERVICE_ACCOUNT_KEY }}
-            project_id: ${{ secrets.PROJECT_ID }}
-            export_default_credentials: true
-    
-        - name: Trigger cloudbuild job
-            run: |
-            gcloud builds submit --config=cloudbuild.yaml .
-    
-    ```
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v0.2.0
+        with:
+          service_account_key: ${{ secrets.SERVICE_ACCOUNT_KEY }}
+          project_id: ${{ secrets.PROJECT_ID }}
+          export_default_credentials: true
+
+      - name: Trigger cloudbuild job
+        run: |
+          gcloud builds submit --config=cloudbuild.yaml .
+```
 
 ### Step 8: Create a Terraform file
 
-Create a <Snippet>main.tf</Snippet> file in the root of your repository with the following content.
+Create a <Snippet>main.tf</Snippet> file in the root of your repository.
 
 ```hcl
 
@@ -163,7 +161,7 @@ resource "google_project_iam_member" "logs_writer" {
 
 ### Step 9: Run Terraform
 
-Run the following commands to apply the Terraform configuration.
+Apply the Terraform configuration.
 
 ```bash
 
@@ -175,11 +173,11 @@ terraform apply
 
 ## Usage
 
-Commit the changes to your repository and push them to the main branch. This will trigger the Github workflow and start the cloudbuild job.
+Commit your changes and push them to the main branch. The push triggers the GitHub workflow, which starts the cloudbuild job.
 
 ## Conclusion
 
-Congratulations! You have successfully used a user-specified service account to trigger a GCP cloudbuild job with Terraform and Yaml using Github CI workflow.
+You've now used a user-specified service account to trigger a GCP cloudbuild job with Terraform and YAML from a GitHub CI workflow.
 
 ## Reference
 
@@ -187,10 +185,10 @@ Congratulations! You have successfully used a user-specified service account to 
 
 - [Service Account](https://cloud.google.com/iam/docs/service-accounts)
 
-- [Github Secrets](https://docs.github.com/en/actions/reference/encrypted-secrets)
+- [GitHub Secrets](https://docs.github.com/en/actions/reference/encrypted-secrets)
 
 - [Terraform](https://www.terraform.io/docs/index.html)
 
 - [Cloud Build](https://cloud.google.com/cloud-build)
 
-- [Github Actions](https://docs.github.com/en/actions) 
+- [GitHub Actions](https://docs.github.com/en/actions) 

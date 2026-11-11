@@ -1,19 +1,19 @@
 ---
-title: Concurrency Part 3- Level Up Your Go Concurrency Skills 
-description: Master advanced synchronization tools, error handling techniques, and common design patterns for sophisticated concurrent Go applications. 
+title: "Concurrency part 3: level up your Go concurrency skills"
+description: Master advanced synchronization tools, error handling techniques, and common design patterns for concurrent Go applications. 
 published: 1708632000000
 slug: go-concurrency3
 ---
 
 <ThemedImage filename="gocat.png" width={300} height={300} />
 
-In the previous posts, we covered the basics of Go concurrency and how to use channels and goroutines to write concurrent programs. In this post, we will take a deep dive into advanced synchronization tools, error handling techniques, and common design patterns for sophisticated concurrent Go applications.
+In the previous posts, I covered the basics of Go concurrency and how to use channels and goroutines to write concurrent programs. This post covers advanced synchronization tools, error handling techniques, and common design patterns for concurrent Go applications.
 
-## Advanced Synchronization Tools
+## Advanced synchronization tools
 
 ### WaitGroup
 
-The <Snippet>sync.WaitGroup</Snippet> type is a powerful synchronization tool that allows you to wait for a collection of goroutines to complete. It is particularly useful when you need to wait for a group of goroutines to finish before proceeding to the next step in your program.
+The <Snippet>sync.WaitGroup</Snippet> type lets you wait for a collection of goroutines to complete. Use it when a group of goroutines has to finish before your program moves to the next step.
 
 Here&apos;s an example of how to use <Snippet>sync.WaitGroup</Snippet>:
 
@@ -43,11 +43,11 @@ func main() {
 }
 ```
 
-In this example, we create a <Snippet>sync.WaitGroup</Snippet> and call its <Snippet>Add</Snippet> method to add the number of goroutines we want to wait for. Then, we call the <Snippet>Wait</Snippet> method to block until all the goroutines have called <Snippet>Done</Snippet>.
+The example creates a <Snippet>sync.WaitGroup</Snippet> and calls its <Snippet>Add</Snippet> method for each goroutine it needs to wait for. Then it calls <Snippet>Wait</Snippet> to block until all the goroutines have called <Snippet>Done</Snippet>.
 
 ### Mutex
 
-The <Snippet>sync.Mutex</Snippet> type is a mutual exclusion lock that allows you to protect shared resources from concurrent access. It is particularly useful when you need to ensure that only one goroutine can access a resource at a time.
+The <Snippet>sync.Mutex</Snippet> type is a mutual exclusion lock that protects shared resources from concurrent access. Use it when only one goroutine should access a resource at a time.
 
 Here&apos;s an example of how to use <Snippet>sync.Mutex</Snippet>:
 
@@ -93,11 +93,11 @@ func main() {
 }
 ```
 
-In this example, we define a <Snippet>Counter</Snippet> type with a <Snippet>sync.Mutex</Snippet> field. We use the <Snippet>Lock</Snippet> and <Snippet>Unlock</Snippet> methods to protect the <Snippet>value</Snippet> field from concurrent access in the <Snippet>Increment</Snippet> and <Snippet>Value</Snippet> methods.
+The example defines a <Snippet>Counter</Snippet> type with a <Snippet>sync.Mutex</Snippet> field. The <Snippet>Increment</Snippet> and <Snippet>Value</Snippet> methods call <Snippet>Lock</Snippet> and <Snippet>Unlock</Snippet> to protect the <Snippet>value</Snippet> field from concurrent access.
 
 ### RWMutex
 
-The <Snippet>sync.RWMutex</Snippet> type is a reader/writer mutual exclusion lock that allows you to protect shared resources from concurrent access. It is particularly useful when you need to allow multiple goroutines to read a resource at the same time, but only one goroutine to write to it.
+The <Snippet>sync.RWMutex</Snippet> type is a reader/writer mutual exclusion lock that protects shared resources from concurrent access. Use it when multiple goroutines need to read a resource at the same time, but only one goroutine should write to it.
 
 Here&apos;s an example of how to use <Snippet>sync.RWMutex</Snippet>:
 
@@ -135,13 +135,13 @@ func main() {
 }
 ```
 
-In this example, we define a <Snippet>Cache</Snippet> type with a <Snippet>sync.RWMutex</Snippet> field. We use the <Snippet>RLock</Snippet> and <Snippet>RUnlock</Snippet> methods to protect the <Snippet>data</Snippet> field from concurrent read access in the <Snippet>Get</Snippet> method, and the <Snippet>Lock</Snippet> and <Snippet>Unlock</Snippet> methods to protect it from concurrent write access in the <Snippet>Set</Snippet> method.
+The example defines a <Snippet>Cache</Snippet> type with a <Snippet>sync.RWMutex</Snippet> field. The <Snippet>Get</Snippet> method calls <Snippet>RLock</Snippet> and <Snippet>RUnlock</Snippet> to protect the <Snippet>data</Snippet> field during concurrent reads. The <Snippet>Set</Snippet> method calls <Snippet>Lock</Snippet> and <Snippet>Unlock</Snippet> to protect it during concurrent writes.
 
-## Error Handling Techniques
+## Error handling techniques
 
-### Error Groups
+### Error groups
 
-The <Snippet>errgroup</Snippet> package in the <Snippet>golang.org/x/sync</Snippet> module provides a convenient way to handle errors from a group of goroutines. It allows you to run a collection of goroutines and return the first error encountered.
+The <Snippet>errgroup</Snippet> package in the <Snippet>golang.org/x/sync</Snippet> module handles errors from a group of goroutines. It runs a collection of goroutines and returns the first error encountered.
 
 Here&apos;s an example of how to use <Snippet>errgroup</Snippet>:
 
@@ -174,11 +174,11 @@ func main() {
 }
 ```
 
-In this example, we create an <Snippet>errgroup.Group</Snippet> and call its <Snippet>Go</Snippet> method to add the number of goroutines we want to run. Then, we call the <Snippet>Wait</Snippet> method to block until all the goroutines have finished, and check if there was an error.
+The example creates an <Snippet>errgroup.Group</Snippet> and calls its <Snippet>Go</Snippet> method for each goroutine it wants to run. Then it calls <Snippet>Wait</Snippet> to block until all the goroutines have finished, and checks whether there was an error.
 
-### Error Channels
+### Error channels
 
-You can use channels to propagate errors from goroutines to the main function. This allows you to handle errors in a centralized location and avoid the need for complex error handling logic in each goroutine.
+Channels can carry errors from goroutines back to the main function, so you handle them in one place instead of in each goroutine.
 
 Here&apos;s an example of how to use error channels:
 
@@ -214,13 +214,13 @@ func main() {
 }
 ```
 
-In this example, we define a <Snippet>worker</Snippet> function that takes an error channel as an argument. If an error occurs during the work, it sends the error to the channel. Then, in the main function, we create an error channel and start the worker goroutine. We use a select statement to wait for the error to be sent on the channel and handle it if it occurs.
+The example defines a <Snippet>worker</Snippet> function that takes an error channel as an argument. If the work fails, it sends the error to the channel. The main function creates an error channel and starts the worker goroutine. The receive from the channel blocks until the worker sends its result, and main handles the error if there is one.
 
-## Common Design Patterns
+## Common design patterns
 
-### Fan-In
+### Fan-in
 
-The fan-in pattern is a common design pattern for combining the output of multiple goroutines into a single channel. It is particularly useful when you need to process data from multiple sources concurrently.
+The fan-in pattern combines the output of multiple goroutines into a single channel. Use it to process data from multiple sources concurrently.
 
 Here&apos;s an example of how to use the fan-in pattern:
 
@@ -230,37 +230,44 @@ package main
 
 import (
     "fmt"
+    "sync"
 )
 
-func producer(ch chan<- int) {
-    for i := 0; i < 5; i++ {
-        ch <- i
-    }
-    close(ch)
-}
-
-func consumer(ch <-chan int) {
-    for v := range ch {
-        fmt.Println("Received value:", v)
+func producer(id int, out chan<- string) {
+    for i := 0; i < 3; i++ {
+        out <- fmt.Sprintf("producer %d: value %d", id, i)
     }
 }
 
 func main() {
-    ch := make(chan int)
+    out := make(chan string)
+    var wg sync.WaitGroup
 
-    go producer(ch)
-    go consumer(ch)
+    for id := 1; id <= 2; id++ {
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            producer(id, out)
+        }(id)
+    }
 
-    // Wait for the goroutines to finish
-    // ...
+    // Close the merged channel once every producer has finished
+    go func() {
+        wg.Wait()
+        close(out)
+    }()
+
+    for v := range out {
+        fmt.Println("Received:", v)
+    }
 }
 ```
 
-In this example, we define a <Snippet>producer</Snippet> function that sends values to a channel, and a <Snippet>consumer</Snippet> function that receives values from the channel. Then, in the main function, we create a channel and start the producer and consumer goroutines. We use a select statement to wait for the goroutines to finish.
+The example starts two <Snippet>producer</Snippet> goroutines that send values to the same channel. Neither producer can close that channel, because the other may still be sending. A <Snippet>sync.WaitGroup</Snippet> tracks both, and a separate goroutine closes the channel after they finish. The main function ranges over the merged channel, so it receives every value and returns once the channel closes.
 
-### Fan-Out
+### Fan-out
 
-The fan-out pattern is a common design pattern for distributing the work of a single goroutine to multiple worker goroutines. It is particularly useful when you need to process a large amount of data concurrently.
+The fan-out pattern distributes the work of a single goroutine to multiple worker goroutines. Use it to process a large amount of data concurrently.
 
 Here&apos;s an example of how to use the fan-out pattern:
 
@@ -270,21 +277,26 @@ package main
 
 import (
     "fmt"
+    "sync"
 )
 
 func worker(id int, in <-chan int, out chan<- int) {
     for v := range in {
         out <- v * 2
     }
-    close(out)
 }
 
 func main() {
     in := make(chan int)
     out := make(chan int)
+    var wg sync.WaitGroup
 
     for i := 0; i < 5; i++ {
-        go worker(i, in, out)
+        wg.Add(1)
+        go func(id int) {
+            defer wg.Done()
+            worker(id, in, out)
+        }(i)
     }
 
     go func() {
@@ -294,17 +306,23 @@ func main() {
         close(in)
     }()
 
+    // Close out only after every worker has stopped sending
+    go func() {
+        wg.Wait()
+        close(out)
+    }()
+
     for v := range out {
         fmt.Println("Received value:", v)
     }
 }
 ```
 
-In this example, we define a <Snippet>worker</Snippet> function that receives values from an input channel, processes them, and sends the results to an output channel. Then, in the main function, we create input and output channels and start multiple worker goroutines. We use a select statement to wait for the results to be sent on the output channel.
+The example defines a <Snippet>worker</Snippet> function that receives values from an input channel, processes them, and sends the results to an output channel. The main function starts five workers that read from the same input channel. Several workers write to the output channel, so none of them can close it without risking a panic when another worker sends. A <Snippet>sync.WaitGroup</Snippet> tracks the workers, and a separate goroutine closes the output channel after all of them finish. The main function ranges over the output channel until it closes.
 
 ### Pipeline
 
-The pipeline pattern is a common design pattern for connecting multiple stages of processing using channels. It is particularly useful when you need to process data in a series of steps.
+The pipeline pattern connects multiple stages of processing using channels. Use it to process data in a series of steps.
 
 Here&apos;s an example of how to use the pipeline pattern:
 
@@ -342,27 +360,24 @@ func main() {
 
     go producer(out)
     go doubler(out, out2)
-    go consumer(out2)
 
-    // Wait for the goroutines to finish
-    // ...
+    // consumer runs on the main goroutine, so main returns
+    // only after the last value has gone through the pipeline
+    consumer(out2)
 }
 ```
 
-In this example, we define a <Snippet>producer</Snippet> function that sends values to an output channel, a <Snippet>doubler</Snippet> function that receives values from an input channel, processes them, and sends the results to an output channel, and a <Snippet>consumer</Snippet> function that receives values from an input channel. Then, in the main function, we create input and output channels and start the producer, doubler, and consumer goroutines. We use a select statement to wait for the goroutines to finish.
+The example defines three functions. <Snippet>producer</Snippet> sends values to an output channel. <Snippet>doubler</Snippet> receives values from an input channel, processes them, and sends the results to an output channel. <Snippet>consumer</Snippet> receives values from an input channel. The main function starts the producer and doubler as goroutines and runs the consumer itself. Each stage closes its output channel when its input runs out, so the consumer&apos;s range loop ends after the last value and the program exits.
 
 ## Conclusion
 
-In this post, we covered advanced synchronization tools, error handling techniques, and common design patterns for sophisticated concurrent Go applications.
+This post covered advanced synchronization tools, error handling techniques, and common design patterns for concurrent Go applications.
 
-We learned how to use <Snippet>sync.WaitGroup</Snippet> to wait for a collection of goroutines to complete, <Snippet>sync.Mutex</Snippet> to protect shared resources from concurrent access, and <Snippet>sync.RWMutex</Snippet> to allow multiple goroutines to read a resource at the same time, but only one goroutine to write to it.
+<Snippet>sync.WaitGroup</Snippet> waits for a collection of goroutines to complete. <Snippet>sync.Mutex</Snippet> protects shared resources from concurrent access. <Snippet>sync.RWMutex</Snippet> lets multiple goroutines read a resource at the same time, but only one write to it.
 
-We also learned how to use the <Snippet>errgroup</Snippet> package to handle errors from a group of goroutines, and error channels to propagate errors from goroutines to the main function.
+The <Snippet>errgroup</Snippet> package handles errors from a group of goroutines, and error channels propagate errors from goroutines to the main function.
 
-Finally, we learned about common design patterns such as fan-in, fan-out, and pipeline, and how to use them to write concurrent Go programs.
-
-
-I hope this post has provided you with some useful insights! 
+Fan-in, fan-out, and pipeline are common design patterns for writing concurrent Go programs.
 
 {/* If you have any questions or feedback, please feel free to reach out to me on [Twitter](https://twitter.com/codewitty_).  */}
 

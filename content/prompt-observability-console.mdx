@@ -1,62 +1,62 @@
 ---
-title: Why I Built Our Own LLM Eval Stack — and Why Retool Was the Best Decision I Made
-description: Every "production-ready" LLM eval framework I tried wanted to own our prompts. None could grade whether a 911 response was correct. Here's what I built instead, and why a Retool front-end was the unlock that made the whole loop work.
+title: Why I built our own LLM eval stack, and why Retool was the best decision I made
+description: Every "production-ready" LLM eval framework I tried wanted to own our prompts. None could grade whether a 911 response was correct. Here's what I built instead, and why a Retool front end made the loop work.
 published: 1726401600000
 slug: prompt-observability-console
 ---
 
 <StaticImg
   src="/prompt-observability-console-header.png"
-  alt="Prompt observability console — build vs buy, version compare, review queue, evaluation summary, telemetry, and deploy gate"
+  alt="Prompt observability console: build vs buy, version compare, review queue, evaluation summary, telemetry, and deploy gate"
   width={1600}
   height={900}
 />
 
-When I joined Aurelian to help ship conversational AI for non-emergency public-safety calls, I walked into the same problem every team that ships LLMs in production has: prompt iteration was blind. A change that "felt better" in the dev loop would silently regress correctness in prod. Latency would creep on a Wednesday and nobody could tell which of three prompt edits caused it. There was no way to A/B with eval coverage, no way to attribute regressions to a specific prompt version, and — worst — no way to involve the people who actually knew whether the AI's response was correct.
+When I joined Aurelian to help ship conversational AI for non-emergency public-safety calls, I walked into the problem every team shipping LLMs in production has: prompt iteration was blind. A change that "felt better" in the dev loop silently regressed correctness in prod. Latency crept on a Wednesday and nobody could tell which of three prompt edits caused it. There was no way to A/B with eval coverage or to attribute regressions to a prompt version. Worst, there was no way to involve the people who knew whether the AI's response was correct.
 
 Those people weren't on the engineering team. They were dispatch trainers, supervisors, and ops folks who had spent decades grading dispatcher performance against agency-specific protocols. They were the only people on earth who could tell you, with authority, whether a 30-second exchange between AI and citizen was right.
 
-So I started looking at the LLM observability and eval landscape — PromptLayer, LangSmith, Helicone, Braintrust, Humanloop, Promptfoo, Phoenix, Vellum — for something specific: a tool that could close the loop between subject-matter-expert judgment and the prompts running in production.
+So I looked through the LLM observability and eval tools (PromptLayer, LangSmith, Helicone, Braintrust, Humanloop, Promptfoo, Phoenix, Vellum) for one that could close the loop between subject-matter-expert judgment and the prompts running in production.
 
 I couldn't find one.
 
-This is the story of why, and what I ended up building instead.
+This is the story of why, and what I built instead.
 
 ## The shape of the problem
 
-Production LLM systems fail in ways that no traditional software pipeline catches:
+Production LLM systems fail in ways no traditional software pipeline catches.
 
-- A prompt version "passes review" because the engineer eyeballed five outputs and they looked fine. The other 95% of inputs in production hit a regression that nobody saw.
+- A prompt version "passes review" because the engineer eyeballed five outputs and they looked fine. The other 95% of production inputs hit a regression nobody saw.
 - p99 latency doubles on a deploy. Was it the new prompt? The new model version? The new function-calling path? Without per-version telemetry, you don't know.
 - An LLM-as-judge eval score goes up. Real users hate the new responses. The judge was wrong, but the judge is itself an LLM, so you can't audit *why*.
-- The team learns from a customer escalation that a class of inputs has been failing for three weeks. Nobody on the engineering team would have flagged it because nobody on the engineering team is the right person to flag it.
+- The team learns from a customer escalation that a class of inputs has been failing for three weeks. Nobody on the engineering team would have flagged it, because none of them is the right person to flag it.
 
-I had every one of these. The first iteration of the prompt observability work wasn't a console — it was a stack of regret.
+I had all four. The first iteration of the prompt observability work wasn't a console. It was a stack of regret.
 
-## Why I tried — and rejected — every off-the-shelf option
+## Why I tried and rejected every off-the-shelf option
 
-I *wanted* to buy. I tried hard. Here's where each tool I evaluated broke down for a high-stakes voice domain.
+I *wanted* to buy, and I tried hard. Here's where each tool I evaluated broke down for a high-stakes voice domain.
 
 ### Domain-specific correctness isn't string similarity
 
-Most generic eval frameworks ship with graders like BLEU, ROUGE, semantic similarity, or a generic LLM-as-judge prompt. None of them can tell you whether the AI gathered the right cross-streets in a non-emergency report, escalated the right intent to a live dispatcher, or followed an agency-specific protocol that's different in Seattle than it is in Salt Lake City.
+Most eval frameworks ship with graders like BLEU, ROUGE, semantic similarity, or a generic LLM-as-judge prompt. None of them can tell you whether the AI gathered the right cross-streets in a non-emergency report, escalated the right intent to a live dispatcher, or followed an agency-specific protocol that differs between Seattle and Salt Lake City.
 
-"Correctness" in the domain looks like:
+"Correctness" in the domain looks like this:
 
 - Did the AI extract every required field for this incident type?
 - Did it escalate the moment a high-stakes intent was detected?
-- Did it follow this agency's *specific* protocol — not the one next door?
+- Did it follow this agency's *specific* protocol, not the one next door?
 - Did the response read as professional and procedurally appropriate to a trained ear?
 
 The first three are programmatic. The fourth requires a human who's graded thousands of dispatcher exchanges. No off-the-shelf grader does either of those well.
 
-### No surface for non-technical SMEs
+### No UI for non-technical SMEs
 
 This was the deal-breaker.
 
-Every eval framework I evaluated was built for ML engineers writing Python. The interaction model was: engineer writes a grader, runs it, looks at a dashboard. The dashboards were dashboards for engineers — token counts, latency histograms, judge-prompt diffs.
+Every eval framework I evaluated targeted ML engineers writing Python. An engineer writes a grader, runs it, and looks at a dashboard. The dashboards showed what engineers care about: token counts, latency histograms, judge-prompt diffs.
 
-The people who could actually tell us whether a response was correct didn't write Python. They wanted to:
+The people who could tell us whether a response was correct didn't write Python. They wanted to:
 
 1. Open a queue of recent calls.
 2. Listen to the audio.
@@ -64,9 +64,9 @@ The people who could actually tell us whether a response was correct didn't writ
 4. Mark "good" / "needs review" / "wrong" on each exchange.
 5. Leave a note for engineering when something was off.
 
-And — the bigger ask — they wanted to *experiment*. A trainer who has graded ten thousand dispatch calls usually has a strong intuition for what the prompt should say. They wanted to draft a candidate prompt, run it against the eval suite, see how it scored, iterate. Without writing Python. Without opening a pull request. Without an engineer in the loop until the candidate was actually good.
+The bigger ask: they wanted to *experiment*. A trainer who has graded ten thousand dispatch calls usually has a strong intuition for what the prompt should say. They wanted to draft a candidate prompt, run it against the eval suite, see how it scored, iterate. Without writing Python. Without opening a pull request. Without an engineer in the loop until the candidate was good.
 
-No tool I tried had a surface that was usable by a non-engineer without writing the UI ourselves anyway. And once I was writing the UI ourselves, I was already most of the way to writing the framework.
+No tool I tried had a UI a non-engineer could use without us writing one anyway. And once I was writing the UI, I was most of the way to writing the framework.
 
 ### Voice and multi-turn were second-class citizens
 
@@ -74,29 +74,29 @@ Most frameworks assumed a single-turn text task. Ours was multi-turn audio with 
 
 ### Per-token latency wasn't first-class
 
-For voice, what matters isn't end-to-end latency on a single call. It's time-to-first-token (TTFT) and per-utterance latency, broken down by prompt version, by intent, by jurisdiction. The frameworks measured end-to-end. I needed slices. I was going to build the slicing logic anyway.
+For voice, what matters isn't end-to-end latency. It's time-to-first-token (TTFT) and per-utterance latency, broken down by prompt version, by intent, by jurisdiction. The frameworks measured end-to-end. I needed slices. I was going to build the slicing logic anyway.
 
 ### Data residency
 
-Pushing call transcripts through a third-party eval service had obvious downstream concerns — regulatory, customer-trust, contractual. Even if a vendor offered a private deployment, the diligence cost on every renewal would have been non-trivial.
+Pushing call transcripts through a third-party eval service raised regulatory, customer-trust, and contractual concerns. Even if a vendor offered a private deployment, every renewal would have carried real diligence cost.
 
 ### They wanted to own our prompts
 
-This was a quieter dealbreaker but a real one. Most frameworks expect prompts to live in *their* registry, edited in *their* UI, deployed via *their* SDK. For a regulated domain I wanted prompts in the repo: code-reviewable, version-controlled with the application code, deployable atomically with the code that consumed them. Putting prompts behind a vendor's web app meant:
+This was a quieter dealbreaker, but a real one. Most frameworks expect prompts to live in *their* registry, edited in *their* UI, deployed via *their* SDK. For a regulated domain I wanted prompts in the repo: code-reviewable, version-controlled with the application code, deployable atomically with the code that consumed them. Putting prompts behind a vendor's web app meant:
 
 - A separate RBAC story to maintain
 - A separate outage profile (their downtime is your downtime)
 - An impedance mismatch any time a prompt change needed to ship with a code change
 
-### No deploy-gate primitive
+### No deploy gate
 
-"Block deploy if eval regresses" wasn't a primitive in any framework I evaluated. I was going to write the CI integration anyway. If I was writing the integration glue *and* most of the slicing *and* most of the SME UI, I was already writing the framework.
+No framework I evaluated had a built-in "block deploy if eval regresses." I was going to write the CI integration anyway. If I was writing the integration glue *and* most of the slicing *and* most of the SME UI, I was already writing the framework.
 
-The build-vs-buy math kept landing in the same place: integration work to make any of these tools fit the process was equal to or greater than building it from scratch. So I built it.
+The build-vs-buy math kept landing in the same place. Making any of these tools fit the process took as much integration work as building from scratch, or more. So I built it.
 
 ## What I built
 
-The internal name for the system was the Prompt Observability Console. Externally we usually called it "the eval thing." It had four pieces.
+The internal name was the Prompt Observability Console. Informally we called it "the eval thing." It had four pieces.
 
 ### 1. The prompt registry
 
@@ -117,7 +117,7 @@ METADATA = PromptMetadata(
 )
 ```
 
-The registry generates a content hash at build time. Every deployed binary knows the hash of every prompt it's pinned to. Telemetry rows reference prompts by hash — not by name — so I can trace a regression all the way back to the literal bytes that produced it.
+The registry generates a content hash at build time. Every deployed binary knows the hash of every prompt it's pinned to. Telemetry rows reference prompts by hash, not by name, so I can trace a regression back to the literal bytes that produced it.
 
 Code-reviewable, atomic, immutable in production. No vendor outage takes down the prompt store.
 
@@ -128,11 +128,11 @@ A queue-based service that runs prompt versions against a curated dataset of can
 I built two grader families:
 
 - **Programmatic graders** for objective things: intent match, required-fields-extracted, latency under budget, schema validity, escalation timing. Pure functions over <Snippet>(prompt_version, input, output)</Snippet>.
-- **LLM-as-judge graders** for subjective things: tone, procedural appropriateness, escalation justification. Each judge prompt was itself versioned and itself eval'd against human-labeled examples.
+- **LLM-as-judge graders** for subjective things: tone, procedural appropriateness, escalation justification. Each judge prompt had its own version and its own evals against human-labeled examples.
 
-The full eval suite ran on every prompt change in CI, and on a rolling cadence in prod against a sampled stream of real calls — sanitized, tightly access-controlled.
+The full eval suite ran in CI on every prompt change. It also ran on a rolling cadence in prod against a sampled stream of real calls, sanitized and tightly access-controlled.
 
-A typical programmatic grader:
+Here is a typical programmatic grader.
 
 ```python
 @grader(name="required_fields_present")
@@ -151,7 +151,7 @@ A judge grader is a thin wrapper over a model call with a strict schema response
 
 ### 3. Per-version telemetry
 
-Every production call writes rows keyed by prompt content hash:
+Every production call writes rows keyed by prompt content hash.
 
 - p50 / p95 / p99 end-to-end latency
 - Time-to-first-token, per-token latency
@@ -160,25 +160,25 @@ Every production call writes rows keyed by prompt content hash:
 - Error rate
 - Outcomes (escalation triggered? handoff successful? caller-side post-call signal?)
 
-Per content hash. So when intake v23 shipped and p95 regressed by 200ms, I could see the regression by Friday afternoon and roll back by Friday evening — not by next Tuesday, after a customer ticket.
+When intake v23 shipped and p95 regressed by 200ms, I saw it by Friday afternoon and rolled back by Friday evening, not next Tuesday after a customer ticket.
 
-### 4. The Retool layer (the unlock)
+### 4. The Retool layer
 
-This is the part I'm proudest of, and the part I think most teams overlook.
+This is the part I'm proudest of, and the part I think most teams skip.
 
-I built the entire SME-facing surface in Retool, pointed at the internal API. Five screens:
+I built the SME-facing UI in Retool, pointed at the internal API. It had five screens.
 
 - **Review queue.** Recent calls, paginated by prompt version, prioritized by uncertainty. SMEs grade in seconds, not minutes.
-- **Side-by-side.** Prompt v17 vs v18, the same call replayed through both. The deltas highlighted automatically. SMEs vote, vote rolls into the eval scorecard.
+- **Side-by-side.** Prompt v17 vs v18, the same call replayed through both, with deltas highlighted automatically. SMEs vote, and the vote rolls into the eval scorecard.
 - **Regression dashboard.** Pass rate per criterion, per prompt version, per agency. The first time I showed it to a dispatch trainer, she found a regression I had missed in three minutes.
 - **Cherry-pick eval.** Paste a transcript, run it through any prompt version on demand. Used heavily during incident review.
-- **Prompt sandbox.** The most important screen, and the one I built last. SMEs could fork the current prod prompt (or start from scratch), edit it freely, and fire it through the full canonical eval suite — no Python, no PR, no engineer in the loop. They'd see pass rates per criterion, latency estimates, and a side-by-side diff against prod. When a candidate beat the baseline, the screen would generate a draft pull request from the sandbox state and ping engineering for review. Guardrails kept it safe: candidates only ran against the sanitized canonical dataset (never live calls), spend was rate-limited per user, and every sandbox run was logged and attributable.
+- **Prompt sandbox.** The most important screen, and the one I built last. SMEs could fork the current prod prompt (or start from scratch), edit it, and fire it through the full canonical eval suite. No Python, no PR, no engineer in the loop. They saw pass rates per criterion, latency estimates, and a side-by-side diff against prod. When a candidate beat the baseline, the screen generated a draft pull request from the sandbox state and pinged engineering for review. Guardrails kept it safe. Candidates only ran against the sanitized canonical dataset (never live calls), spend was rate-limited per user, and every sandbox run was logged and attributable.
 
-The win: dispatch trainers and ops became *active participants in the iteration loop*, not bottlenecks waiting on engineering. They flagged regressions before customers did. They drafted, tested, and refined prompt changes themselves — engineering went from "iterate on prompts" to "review and merge candidates that already passed eval." More changes per week, better changes, less coordination overhead.
+Dispatch trainers and ops became *active participants in the iteration loop*, not bottlenecks waiting on engineering. They flagged regressions before customers did. They drafted, tested, and refined prompt changes themselves. Engineering's job went from "iterate on prompts" to "review and merge candidates that already passed eval." We shipped more changes per week, better ones, with less coordination.
 
-Building this UI from scratch in React would have eaten months of frontend engineering I did not have. Retool let me ship the SME surface in roughly the same time it took to build the backend that powered it.
+Building this UI from scratch in React would have eaten months of frontend engineering I did not have. With Retool I shipped the SME UI in roughly the time it took to build the backend behind it.
 
-There are reasons to be cautious about Retool — vendor lock-in for the SME workflow, performance ceilings on big tables, RBAC quirks. The trade was an obvious win for an internal tool of this shape. I would not put a customer-facing product on Retool. I would absolutely put internal SME tooling there again.
+Retool has real downsides: vendor lock-in for the SME workflow, performance ceilings on big tables, RBAC quirks. For an internal tool of this shape the trade was still an obvious win. I would not put a customer-facing product on Retool. I would absolutely put internal SME tooling there again.
 
 ## The architecture
 
@@ -207,38 +207,38 @@ There are reasons to be cautious about Retool — vendor lock-in for the SME wor
                   └──────────────┘
 ```
 
-Per-call telemetry from production writes into the same results store, keyed by prompt content hash, so the same dashboard works whether you're looking at canonical-eval results or live-traffic outcomes. The deploy gate refuses to promote a prompt change if eval pass rate regresses below a per-criterion threshold.
+Per-call telemetry from production writes into the same results store, so the same dashboard works whether you're looking at canonical-eval results or live-traffic outcomes. The deploy gate refuses to promote a prompt change if eval pass rate regresses below a per-criterion threshold.
 
 ## Trade-offs that mattered
 
-**Eval-as-code vs eval-as-dataset.** Programmatic graders live in code, version-controlled with the prompts they grade. LLM-judge graders live as datasets — input / expected-output pairs — because they evolve with the protocol, not with the application. Different ergonomics, different evolution rates, different review processes.
+**Eval-as-code vs eval-as-dataset.** Programmatic graders live in code, version-controlled with the prompts they grade. LLM-judge graders live as datasets of input / expected-output pairs, because they evolve with the protocol, not with the application. Different ergonomics, different evolution rates, different review processes.
 
 **When to trust LLM-as-judge.** Subjective criteria (tone, justification) get LLM-as-judge with a confidence threshold *plus* periodic human spot-checking. Objective criteria (field extraction, intent match) skip the judge entirely. Treating the judge as authoritative on objective things is how you ship hidden bugs.
 
-**Retool as a first-class production surface.** Vendor lock-in for the SME workflow is a real cost. The speed-to-shipped-product-surface trade is worth it for internal tooling at this scale. Customer-facing? Different calculus.
+**Retool as a first-class production UI.** Vendor lock-in is a real cost. Shipping that fast is worth it for internal tooling at this scale. Customer-facing? Different calculus.
 
-**Prompts in code, not in a vendor.** Prompts are part of the application. They ship with code. They version with code. A prompt-change-only deploy is just a code-only deploy where the diff happens to be a prompt file. It is not a reason to invent a separate change-management process.
+**Prompts in code, not in a vendor.** Prompts are part of the application. They ship with code. They version with code. A prompt-only deploy is just a code deploy where the diff happens to be a prompt file. It is not a reason to invent a separate change-management process.
 
 ## The number
 
-40% reduction in p95 response latency, six months in. Nearly all of the improvement came from prompt changes that nobody on the team would have known to try without per-version telemetry. The console didn't make the prompts smarter — it made the *process of finding the smart prompt* visible.
+40% reduction in p95 response latency, six months in. Nearly all of it came from prompt changes nobody on the team would have known to try without per-version telemetry. The console didn't make the prompts smarter. It made the *process of finding the smart prompt* visible.
 
 ## What I'd do differently
 
-**Invest in the canonical-transcript dataset earlier.** I backfilled it from real calls. The backfill was painful and the early eval suite was noisy until the dataset matured. Start with a curated 50-example seed dataset before you have a single prompt in production.
+**Invest in the canonical-transcript dataset earlier.** Backfilling it from real calls was painful, and the early eval suite was noisy until the dataset matured. Start with a curated 50-example seed dataset before you have a single prompt in production.
 
-**Separate dev / staging / prod prompt pools from day one.** I had one prompt registry that served all three environments and had to evolve into separate pools. Should have been separate from the start.
+**Separate dev / staging / prod prompt pools from day one.** I had one prompt registry serving all three environments and later had to split it.
 
-**Treat the Retool app as a real product.** Versioning, change history, RBAC, on-call ownership. I eventually got there. The first six months it was "the eval thing" with one owner and zero process. Should have been a real product with a roadmap from week one.
+**Treat the Retool app as a real product.** Versioning, change history, RBAC, on-call ownership. I eventually got there. The first six months it was "the eval thing" with one owner and zero process. It should have had a roadmap from week one.
 
 **Write the deploy gate before the dashboard.** I built the dashboard first because it was more visible and felt like progress. The deploy gate caught more regressions in its first week than the dashboard caught in its first month. Block bad changes from shipping; *then* build the surfaces to investigate them.
 
-**Ship the sandbox earlier.** I built review and dashboards first, sandbox last — the order felt right because review was where I was drowning. In hindsight the sandbox unlocked an order of magnitude more leverage. SMEs going from "rate the AI" to "design the AI" was the moment the iteration loop actually closed. If I did it again, the sandbox would be week three.
+**Ship the sandbox earlier.** Review and dashboards came first because review was where I was drowning. In hindsight the sandbox did an order of magnitude more for the loop than anything else. SMEs going from "rate the AI" to "design the AI" was when the loop closed. If I did it again, the sandbox would be week three.
 
 ## The bigger lesson
 
-Most LLM teams I talk to are building an eval loop where engineers are the only graders, the prompts live in a vendor's registry, and the dashboards measure things engineers care about. That works fine if your engineers are the domain experts.
+Most LLM teams I talk to build an eval loop where engineers are the only graders, the prompts live in a vendor's registry, and the dashboards measure things engineers care about. That works fine if your engineers are the domain experts.
 
-In a regulated, high-stakes domain, the engineers are *not* the domain experts. The eval loop has to include the people who are. Tooling that doesn't make those people first-class participants doesn't actually close the loop — it just makes the engineers feel like they have one.
+In a regulated, high-stakes domain, the engineers are *not* the domain experts. The eval loop has to include the people who are. Tooling that doesn't make those people first-class participants doesn't close the loop. It makes the engineers feel like they have one.
 
-Build the tool that lets the right humans *iterate*, not just review. Retool, or whatever your equivalent low-code platform is, will get you there in weeks instead of months. Don't be precious about it.
+Build the tool that lets the right humans *iterate*, not just review. Retool, or your low-code equivalent, will get you there in weeks instead of months. Don't be precious about it.
