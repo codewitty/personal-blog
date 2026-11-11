@@ -1,196 +1,116 @@
 ---
-title: Real-time sync from CRM webhook to buyer dashboard in under a second
-description: The lead that sits in a buyer's pipeline for ten minutes before they see it is the lead that doesn't close. How I built sub-second sync from a CRM webhook to a multi-tenant buyer dashboard, covering webhook idempotency, server-sent events, and the failure modes that demos don't show.
+title: "From CRM webhook to a buyer's phone in one request"
+description: "How a lead gets from an agency's CRM to a buyer's phone at LeadSwitchboard: one synchronous request, notifications sent after commit, and the 3.5-day outage that taught me a 200 response can hide a broken pipeline."
 published: 1751544000000
 slug: realtime-crm-sync
 ---
 
-A buyer's dashboard is competing with their phone. They're a contractor or a service pro, they're moving between jobs, and the moment a new lead lands they want to know. Not in a minute, not after a polling cycle, *now*. The lead that sits in their pipeline for ten minutes before they see it is the lead that doesn't close.
+A buyer is a contractor or a service pro moving between jobs. When a new lead lands they want to know, and the thing in their hand is a phone, not a dashboard. The lead that sits unseen for ten minutes is the lead that doesn't close.
 
-This is the latency budget I built around at LeadSwitchboard: from CRM webhook ingestion to a visible row in the buyer's dashboard, under a second p95. Most of the work isn't where you'd expect. This post covers the architecture, the idempotency patterns, and the failure modes the demo path never shows.
+So the job is to get a lead from the agency's CRM to the right buyer's phone. This post covers the version that shipped at LeadSwitchboard. It's simpler than what I'd have drawn on a whiteboard, and the most useful lesson in it came from an outage.
 
-## The product requirement
+## The path
 
-A lead is created in the agency's CRM, Go High Level (GHL). GHL fires a webhook to the platform. The platform decides which buyer the lead routes to (using the [distribution engine](/blog/lead-distribution-engine)), assigns it, and shows it in the right buyer's dashboard.
-
-The end-to-end requirement is "fast enough that the buyer never doubts the system is working." In practice that's:
-
-- p50 webhook-to-dashboard: under 400ms
-- p95: under 1s
-- Reliability: zero dropped leads, even under retry storms or intermittent GHL outages
-
-The naive setup has the webhook handler write to the DB while the dashboard polls every 30 seconds. It misses the latency budget by 30x. The next-naive setup pushes everything via WebSocket from the webhook handler and fails on reliability the first time a connection drops.
-
-The shape that worked is a hybrid: server-sent events (SSE) for live push, with SWR-driven revalidation as a backstop, and webhook idempotency at the boundary to survive whatever GHL throws at it.
-
-## The webhook flow
-
-The full path:
+A CRM like Go High Level (GHL) posts the lead to a generic webhook with a campaign slug. Meta lead ads have their own endpoint that verifies Meta's signature, pulls the full lead from the Graph API, and hands off to the same ingestion code. Either way, the platform does the rest inside that request:
 
 ```
-GHL → POST /leads/webhook/ghl → ingest → eligibility → distribution
-                                                         ↓
-                                         buyer-side state changes
-                                                         ↓
-                                                event published
-                                                  ↙          ↘
-                                            SSE channel    SWR revalidation hint
-                                                  ↓             ↓
-                                          buyer dashboard receives + renders
+CRM
+  → POST /leads/webhook/generic   (API key with leads:write, campaign slug)
+  → upsert lead on (agency_id, source, external_id)
+  → distribute inline: pool, filter, rank, lock credits, assign
+  → commit
+  → after_commit: SMS, email, and push to each assigned buyer
+  → 201 { distribution, assigned_count, assigned_buyer_ids }
 ```
 
-Each layer has its own concerns:
+There's no queue between the webhook and the buyer. The [distribution engine](/blog/lead-distribution-engine) runs in the request, and by the time the sender gets its response, the buyer's phone has already buzzed.
 
-- **Ingest** is fast and never blocks. Validate signature, dedupe, write a "received" row, return 200. Anything over 50ms goes into a background task.
-- **Eligibility + distribution** runs async. The webhook handler enqueues the lead and returns without waiting. This is essential: GHL's webhook timeout is short, and any slow downstream work (DB lock contention, third-party calls) would cause GHL to retry, which compounds the load.
-- **Event publish** is staged in the same transaction as the assignment row and goes out from an `after_commit` hook, so if the assignment rolls back, no event fires.
-- **SSE channel** is per-buyer. Each authenticated buyer connection gets a stream of events scoped to their ID. Redis pub/sub handles fan-out across backend instances.
-- **SWR revalidation** is the fallback. If the SSE channel closes (network blip, mobile background tab, idle), the buyer catches up on the next revalidation.
+## Why one request
 
-## Idempotency at the webhook boundary
+The platform takes about 3.5 leads a day. The busiest hour in a month saw three. A queue at that volume adds a place for leads to sit and a worker to keep alive, and buys nothing.
 
-GHL retries on any non-200 response. They retry on timeouts. They occasionally deliver duplicates with no retry signal. The boundary has to be idempotent.
+The platform does have a Redis worker. It handles credit-balance emails, auto-recharge results, and dispute digests, and it runs as a Lambda on a 15-minute schedule. That's fine for a low-balance email. It's the wrong home for a lead, where 15 minutes is the difference between a call and a voicemail.
 
-The pattern:
+Running inline also puts the result in the response. The sender gets back `assigned_count` and `assigned_buyer_ids`, so whoever wired up the integration can see in their own logs which buyers got the lead.
+
+The trade-off is that the request is only as fast as its slowest step. If the SMS provider is slow, the webhook response is slow. At this volume I'll take that over a second moving part.
+
+## Notifications wait for the commit
+
+Distribution doesn't send anything while it runs. It appends what it wants to send to `session.info`, and a SQLAlchemy `after_commit` listener picks it up:
 
 ```python
-async def ingest_ghl_webhook(request: Request, db: AsyncSession):
-    # 1. Verify signature (reject malformed at the door)
-    if not verify_ghl_signature(request):
-        return Response(status_code=401)
+@event.listens_for(Session, "after_commit")
+def handle_lead_assignment_after_commit(session: Session) -> None:
+    items = session.info.pop("post_commit_lead_notifications", None)
+    if not items:
+        return
 
-    payload = await request.json()
-    event_id = payload["eventId"]
-
-    # 2. Idempotency: have we seen this exact event before?
-    existing = await db.execute(
-        select(WebhookEvent).where(
-            WebhookEvent.source == "ghl",
-            WebhookEvent.event_id == event_id,
-        )
-    )
-    if existing.scalar_one_or_none():
-        return Response(status_code=200)  # ack the retry, no work done
-
-    # 3. Record the event row first, then enqueue downstream work
-    event_row = WebhookEvent(
-        source="ghl",
-        event_id=event_id,
-        payload=payload,
-        received_at=now(),
-    )
-    db.add(event_row)
-    await db.commit()
-
-    # 4. Enqueue distribution; return immediately
-    await enqueue_lead_distribution(event_row.id)
-    return Response(status_code=200)
+    with fresh_session_with_retry() as db:
+        for item in items:
+            try:
+                _send_notifications_for_assignment(
+                    db, item["lead_id"], item["buyer_id"], item["agency_id"]
+                )
+                db.commit()
+            except Exception as e:
+                logger.error(f"Error processing lead assignment notification item: {e}", exc_info=True)
+                db.rollback()
 ```
 
-Three details that matter:
+Two properties fall out of this. A buyer never gets a text for an assignment that rolled back, because the listener only fires on a durable commit. And a failed text never undoes an assignment, because notifications run on their own session, one item at a time. The same buffer-then-commit pattern carries the agency's Slack alerts, Zapier hooks, and buyer webhooks.
 
-- **The signature check is first, even before parsing.** Forged events shouldn't get a row in the events table.
-- **The idempotency check is by `(source, event_id)`.** GHL's event ID is globally unique. The compound key leaves room for other webhook sources (Stripe, Twilio, etc.).
-- **The downstream work is enqueued, not executed.** If distribution fails, GHL has already received the 200. The retry is ours, not GHL re-firing the webhook.
+## Duplicates
 
-## Server-sent events: simpler than WebSocket, plenty fast
+CRMs resend. The webhook dedupes on the lead itself, keyed on `(agency_id, source, external_id)`. A repeat doesn't get rejected. It updates the existing lead and runs distribution again.
 
-I considered WebSocket for the buyer push. It's bidirectional, which is more than I need: the dashboard talks to the backend over normal HTTP, and only the backend pushes. WebSocket also has a heavier connection cost and more complex middleware integration.
+A second check catches the same person arriving under a new ID. Inside distribution, any buyer who already received that phone number or email in the last 30 days is skipped with `duplicate_contact`.
 
-SSE is one-way push over a long-lived HTTP response. It's simpler to scale, plays nicely with HTTP/2, and matches the traffic shape: the backend has news, the buyer needs to know.
+Meta's webhook gets one more layer. Each delivery writes a `WebhookEvent` row keyed on the leadgen ID, with a unique constraint, so a redelivered batch is a no-op.
 
-The frontend connects on dashboard mount:
+GHL used to have its own webhook with its own event table. I retired it in October 2026. It routed leads by service line alone and never ran the campaign mapping that every other source goes through. GHL accounts now post to the generic webhook with a campaign slug, and the old route returns 410 with a message pointing there.
+
+## The dashboard is the second channel
+
+The buyer's pipeline page fetches its board with a single SWR call and no options:
 
 ```ts
-useEffect(() => {
-  const source = new EventSource("/api/buyer/events");
-  source.addEventListener("lead.assigned", (e) => {
-    const data = JSON.parse(e.data);
-    mutate("/api/buyer/leads");  // SWR cache invalidation
-  });
-  source.addEventListener("lead.updated", (e) => {
-    mutate(`/api/buyer/leads/${JSON.parse(e.data).leadId}`);
-  });
-  return () => source.close();
-}, []);
+const { data: boardData, mutate: mutateBoard } =
+  useSWR<DashboardResponse>(boardUrl, dashboardFetcher);
 ```
 
-Backend side, each connected buyer has a Redis pub/sub subscription scoped to their ID. When an assignment commits, the distribution service publishes:
+There's no polling and no push. SWR's defaults refetch when the page mounts and when the tab regains focus, and that's when it matters. The buyer gets the text, opens the dashboard, and sees the lead. A live-updating board would only help someone staring at it, and nobody stares at a dashboard waiting for a lead.
 
-```python
-await redis.publish(
-    channel=f"buyer:{buyer_id}:events",
-    message=json.dumps({
-        "type": "lead.assigned",
-        "leadId": str(lead.id),
-        "ts": int(time.time()),
-    }),
-)
-```
+## The outage
 
-The connection handler on the receiving instance forwards the message to the buyer's open SSE stream.
+On August 29, 2026, distribution started failing. It ran that way for 3.5 days before anyone noticed.
 
-## SWR revalidation as the safety net
+The webhook did what it was written to do. It caught the exception, kept the lead, and returned success. Meta saw a 200. The lead looked normal in the database. The error went to CloudWatch, and nothing read CloudWatch.
 
-SSE is fast but not reliable. Connections drop. Mobile tabs go background. The user closes the laptop lid. The browser kills the EventSource for energy reasons.
+The fix (#676) was a metric filter on the `Error distributing lead` log line, an alarm on that metric, and an SNS topic that emails two people. I checked it against 30 days of logs: 18 errors across the four outage days, none on the other 26. It would have paged in five minutes instead of 3.5 days.
 
-I treat SSE as a *hint*, a fast notification that something changed, not a guarantee of delivery. The data fetch goes through SWR, which is designed for this pattern:
+It pages by email, not Slack. The Slack bot was failing with `not_in_channel`, and an alarm that can't deliver isn't an alarm.
 
-1. Dashboard mounts, SWR fetches `/api/buyer/leads`
-2. SSE event arrives → call `mutate()` to mark the SWR cache as stale
-3. SWR re-fetches `/api/buyer/leads`, gets fresh data
-4. Component re-renders
+I also removed an alarm. There had been one on the rate of leads assigned to nobody. Measured against the same 30 days, its floor of five leads an hour was met in 0 of 91 active hours, so it could never have fired. And the normal zero-assigned rate is 60%, since plenty of leads legitimately match no buyer. No rate threshold separates broken from normal at that volume. The config comment now says to reinstate it "only with numbers, not intuition."
 
-If step 2 never happens because SSE dropped, step 3 still happens via SWR's normal revalidation triggers: focus, mount, and interval. The buyer sees the lead up to 30 seconds late instead of instantly, but it isn't lost.
+## Why the webhook still returns 200 on failure
 
-The fallback polling interval is 30 seconds, which I chose as the longest a buyer will wait before suspecting the system is broken. With SSE working, polling is essentially silent. Without SSE, the system is still usable.
+The obvious reaction to that outage is to return a 500, so the sender retries. I kept the 200 on purpose.
 
-## Time-to-seen telemetry
+Meta only retries for hours, and the outage ran for days. By the time a retry arrived, the `WebhookEvent` row was already marked terminal, so the retry would dedupe to a no-op anyway. A retry can't recover a multi-day failure. A person can. The comment in the handler says it plainly: "The error alarm is the recovery path, not the retry."
 
-The number that matters isn't time-to-DB-write. It's time-to-buyer-saw-it.
+When distribution fails now, the failure shows up in three places. The agency's Slack gets a `lead.distribution_failed` alert. The admin leads page shows a banner counting failed leads, leaving out the expected ones like no-match and plan caps. And the lead's [distribution trace](/blog/distribution-trace) shows which step it died on.
 
-I instrumented both ends of the pipeline:
+## What I measure
 
-- Backend records `webhook_received_at`, `assignment_committed_at`, `sse_published_at` per lead.
-- Frontend records `client_received_at` when the SSE event lands, and `client_rendered_at` when the row appears on screen.
+The speed-to-lead number in analytics is `viewed_at − delivered_at`: how long a buyer takes to open a lead after it reaches them. That's the number buyers can change.
 
-The full latency stack:
+I don't time the pipeline itself. `Lead.distribution_started_at` exists as a column, and nothing writes it. With every step in one request, the request duration is close enough for now. If the path ever grows a queue, that column is the first thing I'll fill in.
 
-```
-total_latency = webhook_received_to_committed
-              + committed_to_published
-              + published_to_client_received
-              + client_received_to_rendered
-```
+## What this teaches
 
-Tracking each segment separately tells me which one regressed. A spike in `committed_to_published` is usually Redis pub/sub backpressure; a spike in `published_to_client_received` is network or SSE proxy buffering; a spike in `client_received_to_rendered` is a frontend render bottleneck.
+**Build for the volume you have.** A live-push dashboard over Redis pub/sub is the right design for a lot of products. At 3.5 leads a day, the phone is the real-time channel, and the dashboard only needs to be right when someone opens it.
 
-It's one of the only dashboards I check daily.
+**A success response can hide a dead pipeline.** The webhook was correct to return 200 and wrong to be the only signal. Errors you catch on purpose still need something that reads them.
 
-## Failure modes the demo doesn't show
-
-The demo path is happy: webhook fires, assignment commits, SSE delivers, dashboard renders. Most of the engineering went into the failure modes.
-
-**The webhook signature is wrong.** GHL changed their signing scheme silently once, mid-pilot. Every webhook started returning 401. The events table accumulated zero rows for two hours before alerting fired. The fix was a fast-path metric on signature failures, separate from the success path, so silence was distinguishable from "no traffic." Now if signature failures spike, I see it before the customer does.
-
-**The CRM is down.** GHL has had outages. The platform survives them by design. Leads aren't lost; they arrive late when the CRM recovers. But "the buyer's dashboard hasn't lit up in 20 minutes" looks identical to "our pipeline is broken." A status banner sourced from upstream health checks distinguishes "GHL is degraded, this is expected" from "something on our side is wrong."
-
-**The buyer's tab is in the background.** Mobile browsers throttle SSE in background tabs (some kill the connection entirely). When the buyer foregrounds the tab, they need to catch up fast. SWR's `revalidateOnFocus` handles this: when the tab gets visibility, SWR refetches and the dashboard updates. Without it, foregrounded tabs would show stale data for up to 30 seconds.
-
-**The Redis pub/sub instance restarts.** Connected SSE channels survive (the connection handler reconnects to Redis). Messages published during the restart are dropped. SWR catches up within the polling interval. The system degrades gracefully because SSE is a hint, not a guarantee.
-
-**Two backend instances both think they own the SSE connection.** Sticky sessions on the load balancer prevent this. Without them, the connection bounces between instances and messages get lost. This was a half-day debugging session early on.
-
-## What this teaches about platforms
-
-Real-time sync looks like a single feature. It's three:
-
-- **A reliable boundary** that survives upstream retries, signature changes, and outages
-- **A fast push channel** that delivers the happy path under a second
-- **A reliable pull channel** that backstops the push when the network or browser misbehaves
-
-Most teams I've seen build only one. They pick "push" because it's the visible win, build it on WebSocket because they think they need bidirectional, and skip the pull fallback because it works in dev. Then a buyer in the field on flaky LTE never sees their lead and the team spends a sprint debugging "why is real-time broken."
-
-The architecture I'd recommend already exists in good frontends: a fast hint mechanism (SSE, WebSocket, or push notifications, whichever fits your stack) layered over a reliable fetch (SWR, React Query, anything cache-aware with revalidation). The hint accelerates the common case. The fetch is the truth.
-
-Built that way, real-time sync feels instant when the network is good and degrades by seconds, not minutes, when it isn't. That's the bar.
+**Measure before you alarm.** One alarm looked reasonable and could never fire. The other looked crude and would have caught the outage in five minutes. I only knew which was which after counting.
